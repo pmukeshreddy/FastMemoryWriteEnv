@@ -1,0 +1,72 @@
+{
+  "aggregate_metrics": {
+    "answer_correct": 1.0,
+    "answer_success": 1.0,
+    "duplicate_memory_rate": 0.0,
+    "evidence_correct": 1.0,
+    "fact_evidence_coverage": 1.0,
+    "ignored_useful_fact_rate": 0.0,
+    "index_latency_p50": 6.4,
+    "index_latency_p95": 6.574999999999999,
+    "memory_precision": 0.375,
+    "memory_recall": 1.0,
+    "query_count": 4,
+    "query_latency_p95": 9.520000000000001,
+    "stale_memory_rate": 0.0,
+    "storage_tokens_used": 43,
+    "stored_noise_rate": 0.0,
+    "time_to_indexed_memory": 7.750000000000114,
+    "time_to_memory_write": 7.750000000000114,
+    "time_to_raw_write": 1.4624999999998636,
+    "time_to_retrieved_memory": 3711.7749999999996,
+    "time_to_useful_memory": 3716.4125,
+    "useful_memory_per_storage_token": 0.09302325581395349,
+    "write_latency_p50": 6.4,
+    "write_latency_p95": 6.574999999999999
+  },
+  "counts": {
+    "query_metrics": 4,
+    "rollout_records": 60
+  },
+  "episode_id": "ep-small-0",
+  "output_paths": {
+    "eval_summary": "results/mock_run/eval_summary.json",
+    "metrics_csv": "results/mock_run/metrics.csv",
+    "raw_rollouts": "results/mock_run/raw_rollouts.jsonl"
+  },
+  "run_config": {
+    "backend_type": "in_memory_test",
+    "command": "python3 scripts/run_eval.py --mock --use-test-index --output-dir results/mock_run",
+    "dataset_mode": "small",
+    "episode_id": "ep-small-0",
+    "episode_index": 0,
+    "indexing_budget_operations_remaining": 3,
+    "latency_budget_ms": 250,
+    "llm_api_key_configured": false,
+    "llm_base_url": null,
+    "llm_client_type": "MockLLMClient",
+    "llm_model": "mock",
+    "metadata": {
+      "mock": true,
+      "output_dir": "results/mock_run",
+      "use_test_index": true
+    },
+    "pinecone_index_name": null,
+    "policy_name": "LLMMemoryWritePolicy",
+    "seed": 7,
+    "storage_budget_tokens_remaining": 10000,
+    "timestamp_utc": "2026-04-28T03:11:25.328130+00:00"
+  },
+  "score_breakdown": {
+    "answer_correct": 1.0,
+    "duplicate_penalty": 0.0,
+    "evidence_correct": 1.0,
+    "freshness_score": 0.25671750000000004,
+    "latency_penalty": 0.00023800000000000004,
+    "memory_precision": 0.375,
+    "memory_recall": 1.0,
+    "score": 78.77455,
+    "stale_memory_penalty": 0.0,
+    "storage_penalty": 0.0008600000000000001
+  }
+}
