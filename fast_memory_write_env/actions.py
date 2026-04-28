@@ -124,6 +124,7 @@ class SearchMemoryAction(StrictBaseModel):
     query_id: str | None = Field(default=None, pattern=ID_PATTERN)
     top_k: int = Field(default=5, ge=1)
     filters: dict[str, Any] = Field(default_factory=dict)
+    as_of_ms: float | None = Field(default=None, ge=0.0)
 
 
 class AnswerAction(StrictBaseModel):

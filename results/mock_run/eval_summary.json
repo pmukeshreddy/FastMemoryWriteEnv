@@ -60,7 +60,7 @@
     "policy_name": "LLMMemoryWritePolicy",
     "seed": 7,
     "storage_budget_tokens_remaining": 10000,
-    "timestamp_utc": "2026-04-28T19:12:46.539975+00:00"
+    "timestamp_utc": "2026-04-28T19:57:30.535441+00:00"
   },
   "score_breakdown": {
     "answer_correct": 0.25,

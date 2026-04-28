@@ -131,6 +131,29 @@ class MemoryWriteQueue:
         with self._condition:
             return self._closed and not self._items and self._active_count == 0
 
+    def wait_until_no_ready_work(
+        self,
+        *,
+        cutoff_enqueued_at_ms: int,
+        timeout_seconds: float | None = None,
+    ) -> bool:
+        """Return true once no queued/active work that arrived by the cutoff remains."""
+
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        with self._condition:
+            while self._active_count or any(
+                item.enqueued_at_ms <= cutoff_enqueued_at_ms
+                for item in self._items
+            ):
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            return True
+
     def wait_until_idle(self, timeout_seconds: float | None = None) -> bool:
         """Return true when all queued and active work has completed."""
 

@@ -72,6 +72,48 @@ def test_in_memory_index_update_replaces_and_delete_removes() -> None:
     assert index.search("email") == []
 
 
+def test_in_memory_index_searches_latest_available_version_as_of_time() -> None:
+    index = InMemoryIndex()
+    blue = _memory(
+        "mem-color",
+        "The user's favorite color is blue.",
+        metadata={"available_at_ms": 10.0},
+    )
+    red = _memory(
+        "mem-color",
+        "The user's favorite color is red.",
+        metadata={"available_at_ms": 106.0},
+    )
+
+    index.upsert(blue)
+    index.upsert(red)
+
+    assert [hit.content for hit in index.search("favorite color blue", as_of_ms=102.0)] == [
+        "The user's favorite color is blue."
+    ]
+    assert index.search("red", as_of_ms=102.0) == []
+    assert [hit.content for hit in index.search("favorite color red", as_of_ms=200.0)] == [
+        "The user's favorite color is red."
+    ]
+    assert index.search("blue", as_of_ms=200.0) == []
+
+
+def test_in_memory_index_historical_delete_preserves_old_version_before_delete_time() -> None:
+    index = InMemoryIndex()
+    memory = _memory(
+        "mem-color",
+        "The user's favorite color is blue.",
+        metadata={"available_at_ms": 10.0},
+    )
+    index.upsert(memory)
+    index.delete("mem-color", available_at_ms=106.0)
+
+    assert [hit.memory_id for hit in index.search("favorite color blue", as_of_ms=102.0)] == [
+        "mem-color"
+    ]
+    assert index.search("favorite color blue", as_of_ms=200.0) == []
+
+
 def test_in_memory_index_stores_but_does_not_retrieve_unindexed_memory() -> None:
     index = InMemoryIndex()
     memory = _memory(

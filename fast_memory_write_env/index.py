@@ -31,8 +31,8 @@ class RetrievalIndex(Protocol):
     def upsert(self, memory: MemoryRecord) -> None:
         """Insert or replace one memory in the retrieval index."""
 
-    def delete(self, memory_id: str) -> None:
-        """Remove one memory from the retrieval index."""
+    def delete(self, memory_id: str, *, available_at_ms: float | None = None) -> None:
+        """Remove one memory from the retrieval index, optionally at a simulated time."""
 
     def search(
         self,
@@ -40,8 +40,9 @@ class RetrievalIndex(Protocol):
         *,
         top_k: int = 5,
         filters: dict[str, Any] | None = None,
+        as_of_ms: float | None = None,
     ) -> list[SearchResult]:
-        """Search indexed memories."""
+        """Search indexed memories, optionally as of a historical timestamp."""
 
 
 def estimate_tokens(text: str) -> int:

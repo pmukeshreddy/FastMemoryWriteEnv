@@ -112,7 +112,7 @@ class FastMemoryWriteEnv:
         """Set logical time and execute one action under the environment lock."""
 
         with self._lock:
-            self.current_time_ms = max(self.current_time_ms, current_time_ms)
+            self.current_time_ms = current_time_ms
             return self._execute_action_unlocked(action_data)
 
     def _execute_action_unlocked(self, action_data: EnvironmentAction | dict[str, object]) -> ActionResult:
@@ -222,6 +222,7 @@ class FastMemoryWriteEnv:
         )
         delta = self.memory_store.create(memory)
         indexed = False
+        available_at_ms = None
         if action.index_immediately:
             memory = self.memory_store.set_indexed(
                 memory.memory_id,
@@ -229,14 +230,23 @@ class FastMemoryWriteEnv:
                 self.current_time_ms,
             )
             indexed = True
-            self.retrieval_index.upsert(memory)
+            available_at_ms = _available_at_ms(
+                self.current_time_ms,
+                "write_memory",
+                token_count=tokens,
+            )
+            self.retrieval_index.upsert(_memory_available_at(memory, available_at_ms))
         self._consume_storage_budget(delta)
         self._consume_indexing_budget(1 if indexed else 0)
         return _success(
             "write_memory",
             token_count=tokens,
             storage_tokens_delta=delta,
-            payload={"memory_id": memory.memory_id, "indexed": indexed},
+            payload={
+                "memory_id": memory.memory_id,
+                "indexed": indexed,
+                "available_at_ms": available_at_ms,
+            },
         )
 
     def _update_memory(self, action: UpdateMemoryAction) -> ActionResult:
@@ -246,6 +256,7 @@ class FastMemoryWriteEnv:
         should_index = action.index_immediately or previous.indexed
         self._require_storage_budget(projected_delta)
         self._require_indexing_budget(1 if should_index else 0)
+        token_count = estimate_tokens(action.content)
         updated, delta = self.memory_store.update_memory(
             memory_id=action.memory_id,
             content=action.content,
@@ -254,16 +265,26 @@ class FastMemoryWriteEnv:
             updated_at_ms=self.current_time_ms,
             metadata={"last_update_reason": action.reason, **action.metadata},
         )
+        available_at_ms = None
         if should_index:
             updated = self.memory_store.set_indexed(action.memory_id, True, self.current_time_ms)
-            self.retrieval_index.upsert(updated)
+            available_at_ms = _available_at_ms(
+                self.current_time_ms,
+                "update_memory",
+                token_count=token_count,
+            )
+            self.retrieval_index.upsert(_memory_available_at(updated, available_at_ms))
         self._consume_storage_budget(delta)
         self._consume_indexing_budget(1 if should_index else 0)
         return _success(
             "update_memory",
-            token_count=estimate_tokens(action.content),
+            token_count=token_count,
             storage_tokens_delta=delta,
-            payload={"memory_id": action.memory_id, "indexed": should_index},
+            payload={
+                "memory_id": action.memory_id,
+                "indexed": should_index,
+                "available_at_ms": available_at_ms,
+            },
         )
 
     def _mark_stale(self, action: MarkStaleAction) -> ActionResult:
@@ -282,7 +303,10 @@ class FastMemoryWriteEnv:
             },
         )
         if previous.indexed:
-            self.retrieval_index.delete(updated.memory_id)
+            self.retrieval_index.delete(
+                updated.memory_id,
+                available_at_ms=_available_at_ms(self.current_time_ms, "mark_stale"),
+            )
         return _success(
             "mark_stale",
             payload={"memory_id": action.memory_id, "status": updated.status.value},
@@ -331,7 +355,14 @@ class FastMemoryWriteEnv:
                 metadata={"compressed_into": action.target_memory_id},
             )
             if memory_id in indexed_source_ids:
-                self.retrieval_index.delete(compressed.memory_id)
+                self.retrieval_index.delete(
+                    compressed.memory_id,
+                    available_at_ms=_available_at_ms(
+                        self.current_time_ms,
+                        "compress_memory",
+                        token_count=target.estimated_tokens,
+                    ),
+                )
         self._consume_storage_budget(delta)
         return _success(
             "compress_memory",
@@ -345,12 +376,24 @@ class FastMemoryWriteEnv:
 
     def _index_now(self, action: IndexNowAction) -> ActionResult:
         self._require_indexing_budget(1)
-        memory = self._index_memory(action.memory_id)
+        memory = self.memory_store.require(action.memory_id)
+        memory = self._index_memory(
+            action.memory_id,
+            available_at_ms=_available_at_ms(
+                self.current_time_ms,
+                "index_now",
+                token_count=memory.estimated_tokens,
+            ),
+        )
         self._consume_indexing_budget(1)
         return _success(
             "index_now",
             token_count=memory.estimated_tokens,
-            payload={"memory_id": memory.memory_id, "indexed": True},
+            payload={
+                "memory_id": memory.memory_id,
+                "indexed": True,
+                "available_at_ms": memory.metadata.get("available_at_ms"),
+            },
         )
 
     def _delay_index(self, action: DelayIndexAction) -> ActionResult:
@@ -363,7 +406,10 @@ class FastMemoryWriteEnv:
             updated_at_ms=self.current_time_ms,
         )
         if previous.indexed:
-            self.retrieval_index.delete(memory.memory_id)
+            self.retrieval_index.delete(
+                memory.memory_id,
+                available_at_ms=_available_at_ms(self.current_time_ms, "delay_index"),
+            )
         return _success(
             "delay_index",
             payload={
@@ -378,6 +424,7 @@ class FastMemoryWriteEnv:
             action.query_text,
             top_k=action.top_k,
             filters=action.filters,
+            as_of_ms=action.as_of_ms,
         )
         self.last_search_results = results
         return _success(
@@ -386,6 +433,7 @@ class FastMemoryWriteEnv:
             count=len(results),
             payload={
                 "query_id": action.query_id,
+                "as_of_ms": action.as_of_ms,
                 "results": [
                     {
                         "memory_id": result.memory_id,
@@ -424,14 +472,15 @@ class FastMemoryWriteEnv:
             },
         )
 
-    def _index_memory(self, memory_id: str) -> MemoryRecord:
+    def _index_memory(self, memory_id: str, *, available_at_ms: float) -> MemoryRecord:
         memory = self.memory_store.require(memory_id)
         if memory.status != MemoryStatus.ACTIVE:
             raise ValueError(f"cannot index non-active memory: {memory_id}")
         self._validate_source_event_ids(memory.source_event_ids)
         indexed_memory = self.memory_store.set_indexed(memory_id, True, self.current_time_ms)
-        self.retrieval_index.upsert(indexed_memory)
-        return indexed_memory
+        visible_memory = _memory_available_at(indexed_memory, available_at_ms)
+        self.retrieval_index.upsert(visible_memory)
+        return visible_memory
 
     def _validate_source_event_ids(self, source_event_ids: list[str]) -> None:
         missing = [
@@ -501,6 +550,27 @@ def _success(
 def _latency_ms(action_type: str, *, token_count: int = 0, count: int = 0) -> float:
     base = BASE_LATENCY_MS.get(action_type, 1.0)
     return round(base + (token_count * 0.05) + (count * 0.2), 3)
+
+
+def _available_at_ms(
+    current_time_ms: int,
+    action_type: str,
+    *,
+    token_count: int = 0,
+    count: int = 0,
+) -> float:
+    return float(current_time_ms) + _latency_ms(action_type, token_count=token_count, count=count)
+
+
+def _memory_available_at(memory: MemoryRecord, available_at_ms: float) -> MemoryRecord:
+    metadata = dict(memory.metadata)
+    metadata.update(
+        {
+            "available_at_ms": available_at_ms,
+            "indexed_at_ms": available_at_ms,
+        }
+    )
+    return memory.model_copy(update={"metadata": metadata})
 
 
 def _extract_action_type(action_data: object) -> str:

@@ -403,28 +403,22 @@ class StreamingEvaluator:
                         )
                 else:
                     query = item.query
-                    if not memory_write_queue.wait_until_idle(timeout_seconds=30.0):
-                        raise TimeoutError("memory-write queue did not drain before query evaluation")
+                    if not memory_write_queue.wait_until_no_ready_work(
+                        cutoff_enqueued_at_ms=query.timestamp_ms,
+                        timeout_seconds=30.0,
+                    ):
+                        raise TimeoutError("memory-write queue did not process ready work before query evaluation")
                     search_result = self.env.execute_action_at(
-                        SearchMemoryAction(query_id=query.query_id, query_text=query.text, top_k=5),
+                        SearchMemoryAction(
+                            query_id=query.query_id,
+                            query_text=query.text,
+                            top_k=5,
+                            as_of_ms=float(query.timestamp_ms),
+                        ),
                         current_time_ms=query.timestamp_ms,
                     )
                     logical_time_ms += search_result.latency_ms
                     with state_lock:
-                        available_results = _available_search_results(
-                            self.env.last_search_results,
-                            indexed_memory_available_at_ms=indexed_memory_available_at_ms,
-                            query_timestamp_ms=float(query.timestamp_ms),
-                        )
-                        self.env.last_search_results = available_results
-                        search_result = search_result.model_copy(
-                            update={
-                                "payload": {
-                                    **search_result.payload,
-                                    "results": _search_result_rows(available_results),
-                                }
-                            }
-                        )
                         records.append(_action_record(episode.episode_id, query.timestamp_ms, logical_time_ms, search_result))
                     retrieved_memory_ids = [
                         hit["memory_id"]
@@ -646,13 +640,8 @@ def _update_timelines_for_action(
     logical_time_ms: float,
 ) -> None:
     if action_type in {"write_memory", "update_memory"}:
-        memory_id = str(result_payload.get("memory_id") or action_payload.get("memory_id") or "")
-        memory = env.memory_store.get(memory_id) if memory_id else None
-        if memory is None:
-            source_event_ids = [str(event_id) for event_id in action_payload.get("source_event_ids", [])]
-            fact_ids = _fact_ids_for_event_ids(source_event_ids, fact_lifecycles)
-        else:
-            fact_ids = _fact_ids_for_event_ids(memory.source_event_ids, fact_lifecycles)
+        source_event_ids = [str(event_id) for event_id in action_payload.get("source_event_ids", [])]
+        fact_ids = _fact_ids_for_event_ids(source_event_ids, fact_lifecycles)
         for fact_id in fact_ids:
             fact_lifecycles[fact_id].memory_written_at_ms = logical_time_ms
         if result_payload.get("indexed"):
@@ -698,39 +687,13 @@ def _update_index_availability(
     if action_type in {"write_memory", "update_memory", "index_now"} and result_payload.get("indexed"):
         memory_id = result_payload.get("memory_id")
         if isinstance(memory_id, str):
-            indexed_memory_available_at_ms[memory_id] = logical_time_ms
+            indexed_memory_available_at_ms[memory_id] = float(
+                result_payload.get("available_at_ms") or logical_time_ms
+            )
     if action_type in {"mark_stale", "delay_index"}:
         memory_id = result_payload.get("memory_id")
         if isinstance(memory_id, str):
             indexed_memory_available_at_ms.pop(memory_id, None)
-
-
-def _available_search_results(
-    search_results: list[Any],
-    *,
-    indexed_memory_available_at_ms: dict[str, float],
-    query_timestamp_ms: float,
-) -> list[Any]:
-    available: list[Any] = []
-    for result in search_results:
-        available_at_ms = indexed_memory_available_at_ms.get(result.memory_id)
-        if available_at_ms is None and result.memory is not None and result.memory.indexed:
-            available_at_ms = float(result.memory.updated_at_ms)
-        if available_at_ms is not None and available_at_ms <= query_timestamp_ms:
-            available.append(result)
-    return available
-
-
-def _search_result_rows(search_results: list[Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "memory_id": result.memory_id,
-            "score": result.score,
-            "content": result.content,
-            "metadata": result.metadata,
-        }
-        for result in search_results
-    ]
 
 
 def _budget_value(value: int | None, *, fallback: int) -> int:

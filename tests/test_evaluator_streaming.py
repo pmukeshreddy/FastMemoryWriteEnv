@@ -88,6 +88,35 @@ class _WriteAndIndexPolicy:
         )
 
 
+class _ColorUpdatePolicy:
+    def decide(self, *, new_event, active_memories, recent_events, latency_budget_ms, storage_budget_tokens_remaining, indexing_budget_operations_remaining):
+        if new_event.event_id == "event-blue":
+            return validate_memory_actions(
+                [
+                    {
+                        "action_type": "write_memory",
+                        "memory_id": "mem-color",
+                        "entity_id": new_event.entity_id,
+                        "content": new_event.content,
+                        "source_event_ids": [new_event.event_id],
+                        "index_immediately": True,
+                    }
+                ]
+            )
+        return validate_memory_actions(
+            [
+                {
+                    "action_type": "update_memory",
+                    "memory_id": "mem-color",
+                    "content": new_event.content,
+                    "source_event_ids": [new_event.event_id],
+                    "reason": "newer color evidence",
+                    "index_immediately": True,
+                }
+            ]
+        )
+
+
 def test_async_worker_survives_temporary_empty_queue(tmp_path) -> None:
     episode = generate_episode(DatasetMode.SMALL, seed=91, episode_index=0)
     event = next(item.event for item in episode.stream if item.item_type == "event")
@@ -177,6 +206,52 @@ def test_query_retrieves_memory_after_simulated_index_completion(tmp_path) -> No
     assert result.query_metrics[0].time_to_useful_memory is not None
 
 
+def test_old_memory_version_remains_visible_before_future_update_completion(tmp_path) -> None:
+    evaluator = _color_update_evaluator(tmp_path)
+    result = evaluator.evaluate_episode(_color_update_episode(first_query_timestamp_ms=102, second_query_timestamp_ms=200))
+
+    early_query = result.query_metrics[0]
+
+    assert early_query.query_id == "query-blue-102"
+    assert early_query.retrieved_memory_ids == ["mem-color"]
+    assert "blue" in early_query.answer_text
+    assert "red" not in early_query.answer_text
+    assert early_query.answer_success is True
+
+
+def test_updated_memory_version_is_visible_after_update_completion(tmp_path) -> None:
+    evaluator = _color_update_evaluator(tmp_path)
+    result = evaluator.evaluate_episode(_color_update_episode(first_query_timestamp_ms=102, second_query_timestamp_ms=200))
+
+    later_query = result.query_metrics[1]
+
+    assert later_query.query_id == "query-red-200"
+    assert later_query.retrieved_memory_ids == ["mem-color"]
+    assert "red" in later_query.answer_text
+    assert "blue" not in later_query.answer_text
+    assert later_query.answer_success is True
+
+
+def test_future_update_does_not_replace_prior_query_snapshot(tmp_path) -> None:
+    evaluator = _color_update_evaluator(tmp_path)
+    result = evaluator.evaluate_episode(_color_update_episode(first_query_timestamp_ms=102, second_query_timestamp_ms=200))
+
+    early_record = next(
+        record
+        for record in result.rollout_records
+        if record.record_type == "query" and record.payload["query"]["query_id"] == "query-blue-102"
+    )
+    later_record = next(
+        record
+        for record in result.rollout_records
+        if record.record_type == "query" and record.payload["query"]["query_id"] == "query-red-200"
+    )
+
+    assert "blue" in early_record.payload["answer"]["answer"]
+    assert "red" not in early_record.payload["answer"]["answer"]
+    assert "red" in later_record.payload["answer"]["answer"]
+
+
 def _causal_evaluator(tmp_path) -> StreamingEvaluator:
     env = FastMemoryWriteEnv(
         raw_event_store=RawEventStore(tmp_path / "raw.sqlite"),
@@ -188,6 +263,20 @@ def _causal_evaluator(tmp_path) -> StreamingEvaluator:
         policy=_WriteAndIndexPolicy(),
         storage_budget_tokens_remaining=100,
         indexing_budget_operations_remaining=1,
+    )
+
+
+def _color_update_evaluator(tmp_path) -> StreamingEvaluator:
+    env = FastMemoryWriteEnv(
+        raw_event_store=RawEventStore(tmp_path / "raw.sqlite"),
+        memory_store=MemoryStore(tmp_path / "memory.sqlite"),
+        retrieval_index=InMemoryIndex(),
+    )
+    return StreamingEvaluator(
+        env=env,
+        policy=_ColorUpdatePolicy(),
+        storage_budget_tokens_remaining=100,
+        indexing_budget_operations_remaining=5,
     )
 
 
@@ -233,5 +322,90 @@ def _causal_episode(*, query_timestamp_ms: int) -> StreamingEpisode:
         stream=[
             StreamEventItem(timestamp_ms=event.timestamp_ms, event=event),
             StreamQueryItem(timestamp_ms=query.timestamp_ms, query=query),
+        ],
+    )
+
+
+def _color_update_episode(
+    *,
+    first_query_timestamp_ms: int,
+    second_query_timestamp_ms: int,
+) -> StreamingEpisode:
+    blue_fact = EventFact(
+        fact_id="fact-blue",
+        entity_id="entity-main",
+        attribute="favorite_color",
+        value="blue",
+        source_event_id="event-blue",
+        valid_from_ms=0,
+    )
+    red_fact = EventFact(
+        fact_id="fact-red",
+        entity_id="entity-main",
+        attribute="favorite_color",
+        value="red",
+        source_event_id="event-red",
+        valid_from_ms=100,
+    )
+    blue_event = RawEvent(
+        event_id="event-blue",
+        episode_id="ep-color-update",
+        timestamp_ms=0,
+        source="test",
+        user_id="user-main",
+        entity_id="entity-main",
+        category=EventCategory.USEFUL_FACT,
+        content="The user's favorite color is blue.",
+        facts=[blue_fact],
+        estimated_tokens=estimate_tokens("The user's favorite color is blue."),
+    )
+    red_event = RawEvent(
+        event_id="event-red",
+        episode_id="ep-color-update",
+        timestamp_ms=100,
+        source="test",
+        user_id="user-main",
+        entity_id="entity-main",
+        category=EventCategory.STALE_UPDATE,
+        content="The user's favorite color is red.",
+        facts=[red_fact],
+        supersedes=["fact-blue"],
+        estimated_tokens=estimate_tokens("The user's favorite color is red."),
+    )
+    blue_query = Query(
+        query_id=f"query-blue-{first_query_timestamp_ms}",
+        episode_id="ep-color-update",
+        timestamp_ms=first_query_timestamp_ms,
+        user_id="user-main",
+        target_entity_id="entity-main",
+        text="What is the user's favorite color blue?",
+        gold=QueryGold(
+            required_fact_ids=["fact-blue"],
+            supporting_event_ids=["event-blue"],
+            answer_facts=["blue"],
+        ),
+    )
+    red_query = Query(
+        query_id=f"query-red-{second_query_timestamp_ms}",
+        episode_id="ep-color-update",
+        timestamp_ms=second_query_timestamp_ms,
+        user_id="user-main",
+        target_entity_id="entity-main",
+        text="What is the user's favorite color red?",
+        gold=QueryGold(
+            required_fact_ids=["fact-red"],
+            supporting_event_ids=["event-red"],
+            answer_facts=["red"],
+        ),
+    )
+    return StreamingEpisode(
+        episode_id="ep-color-update",
+        mode=DatasetMode.SMALL,
+        seed=0,
+        stream=[
+            StreamEventItem(timestamp_ms=blue_event.timestamp_ms, event=blue_event),
+            StreamEventItem(timestamp_ms=red_event.timestamp_ms, event=red_event),
+            StreamQueryItem(timestamp_ms=blue_query.timestamp_ms, query=blue_query),
+            StreamQueryItem(timestamp_ms=red_query.timestamp_ms, query=red_query),
         ],
     )

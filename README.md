@@ -91,7 +91,7 @@ Required Pinecone environment variables:
 
 `InMemoryIndex` exists only as a unit-test and mock-run fake. It is useful for reproducible local checks, but it is not the production retrieval path.
 
-Memory payloads are written to the retrieval backend only when they are indexed or when an already-indexed memory is updated. Delayed or unindexed memories stay in SQLite until an indexing action succeeds; they are not preloaded into Pinecone as hidden future search state.
+Memory payloads are written to the retrieval backend only when they are indexed or when an already-indexed memory is updated. Delayed or unindexed memories stay in SQLite until an indexing action succeeds; they are not preloaded into Pinecone as hidden future search state. The deterministic test index keeps versioned entries with `available_at_ms`, so query-time search can return the latest memory version available at the query timestamp instead of the latest mutation that happened later in the rollout.
 
 The current index vectorization helper is deterministic and prototype-oriented so local tests and rollouts are reproducible. Pinecone is the real backend, but production retrieval semantics require configuring or extending the embedding path for the target deployment; do not treat the deterministic hashed vectors as a production embedding model.
 
@@ -138,7 +138,7 @@ event arrives
 -> answer uses it correctly
 ```
 
-`time_to_useful_memory` is `null` unless every required fact completes the full chain: event arrival -> raw write -> memory write/update -> index -> retrieval -> successful answer. Query retrieval is causally filtered: a query at time `T` can only retrieve memories whose simulated index completion time is at or before `T`. The breakdown fields remain useful when only part of the path completed.
+`time_to_useful_memory` is `null` unless every required fact completes the full chain: event arrival -> raw write -> memory write/update -> index -> retrieval -> successful answer. Query retrieval is causally filtered: a query at time `T` can only retrieve memory/index versions whose simulated index availability time is at or before `T`. If a memory update completes after `T`, the query still sees the older indexed version that was available at `T`. The breakdown fields remain useful when only part of the path completed.
 
 The environment also reports:
 
@@ -278,6 +278,7 @@ These are `MockLLMClient + InMemoryIndex` test fake results after label hiding, 
 
 - The current answer step is deterministic and uses retrieved memory content; future work can add a separate answer model while preserving evidence checks.
 - The current vectorization helper is deterministic for testing and auditability; real retrieval uses Pinecone as the backend, but production embedding configuration should be expanded.
+- Historical query snapshots are exact in `InMemoryIndex`, which is the deterministic evaluator/test path. The current Pinecone adapter stores the current vector under each memory ID and filters by `available_at_ms`, but Pinecone runs do not yet preserve full historical replaced-vector snapshots for older `as_of_ms` queries.
 - Local answer metrics are transparent and reproducible; LongMemEval claims should be checked with the exported predictions and the official evaluator.
 - The project does not include RL training.
 - Baselines are intentionally minimal sanity checks, not the main result.

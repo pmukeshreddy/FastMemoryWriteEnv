@@ -28,6 +28,8 @@ CANONICAL_MEMORY_METADATA_KEYS = {
     "estimated_tokens",
     "created_at_ms",
     "updated_at_ms",
+    "available_at_ms",
+    "indexed_at_ms",
 }
 
 
@@ -54,7 +56,10 @@ class PineconeIndex:
             namespace=self.config.namespace,
         )
 
-    def delete(self, memory_id: str) -> None:
+    def delete(self, memory_id: str, *, available_at_ms: float | None = None) -> None:
+        # Pinecone stores the current vector under the memory ID. The in-memory
+        # test index keeps historical tombstones; Pinecone deletion remains a
+        # current-state operation.
         self._index.delete(ids=[memory_id], namespace=self.config.namespace)
 
     def search(
@@ -63,13 +68,14 @@ class PineconeIndex:
         *,
         top_k: int = 5,
         filters: dict[str, Any] | None = None,
+        as_of_ms: float | None = None,
     ) -> list[SearchResult]:
         response = self._index.query(
             vector=deterministic_text_vector(query, self.config.dimension),
             top_k=top_k,
             include_metadata=True,
             namespace=self.config.namespace,
-            filter=_search_filter(filters),
+            filter=_search_filter(filters, as_of_ms=as_of_ms),
         )
         matches = _get_matches(response)
         results: list[SearchResult] = []
@@ -138,12 +144,15 @@ def _get_attr(value: Any, key: str, default: Any) -> Any:
     return getattr(value, key, default)
 
 
-def _search_filter(filters: dict[str, Any] | None) -> dict[str, Any]:
-    return {
+def _search_filter(filters: dict[str, Any] | None, *, as_of_ms: float | None = None) -> dict[str, Any]:
+    search_filter = {
         "status": MemoryStatus.ACTIVE.value,
         "indexed": True,
         **(filters or {}),
     }
+    if as_of_ms is not None:
+        search_filter["available_at_ms"] = {"$lte": as_of_ms}
+    return search_filter
 
 
 def _memory_from_metadata(memory_id: str, metadata: dict[str, Any]) -> MemoryRecord | None:

@@ -21,10 +21,10 @@ class _RetrievalContentOnlyIndex:
     def upsert(self, memory) -> None:
         pass
 
-    def delete(self, memory_id: str) -> None:
+    def delete(self, memory_id: str, *, available_at_ms=None) -> None:
         pass
 
-    def search(self, query: str, *, top_k: int = 5, filters=None) -> list[SearchResult]:
+    def search(self, query: str, *, top_k: int = 5, filters=None, as_of_ms=None) -> list[SearchResult]:
         return [
             SearchResult(
                 memory_id="mem-retrieved-only",
