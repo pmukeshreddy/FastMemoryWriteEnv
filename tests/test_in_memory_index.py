@@ -11,6 +11,7 @@ def _memory(
     *,
     entity_id: str = "account-ada",
     status: MemoryStatus = MemoryStatus.ACTIVE,
+    indexed: bool = True,
     metadata: dict[str, object] | None = None,
 ) -> MemoryRecord:
     return MemoryRecord(
@@ -22,7 +23,7 @@ def _memory(
         created_at_ms=100,
         updated_at_ms=100,
         status=status,
-        indexed=True,
+        indexed=indexed,
         estimated_tokens=estimate_tokens(content),
         metadata=metadata or {},
     )
@@ -69,3 +70,17 @@ def test_in_memory_index_update_replaces_and_delete_removes() -> None:
 
     index.delete("mem-001")
     assert index.search("email") == []
+
+
+def test_in_memory_index_stores_but_does_not_retrieve_unindexed_memory() -> None:
+    index = InMemoryIndex()
+    memory = _memory(
+        "mem-delayed",
+        "Account Ada prefers delayed indexing.",
+        indexed=False,
+    )
+
+    index.upsert(memory)
+
+    assert index._memories["mem-delayed"] == memory
+    assert index.search("delayed indexing") == []

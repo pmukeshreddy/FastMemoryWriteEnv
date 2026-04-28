@@ -121,7 +121,7 @@ class AggregateMetrics(StrictBaseModel):
 class RolloutRecord(StrictBaseModel):
     """JSONL-safe rollout record."""
 
-    record_type: Literal["run_config", "event", "action", "query", "query_metric", "aggregate_inputs"]
+    record_type: Literal["run_config", "event", "queue", "action", "query", "query_metric", "aggregate_inputs"]
     episode_id: str
     timestamp_ms: float | None = None
     logical_time_ms: float | None = None
@@ -160,10 +160,51 @@ def evaluate_query_result(
 
     required_fact_ids = set(query.gold.required_fact_ids)
     supporting_event_ids = set(query.gold.supporting_event_ids)
-    cited_fact_ids = {fact_id for memory in cited_memories for fact_id in memory.fact_ids}
+    event_fact_ids = _event_fact_ids_from_lifecycles(fact_lifecycles)
+    cited_fact_ids = {
+        fact_id
+        for memory in cited_memories
+        for event_id in memory.source_event_ids
+        for fact_id in event_fact_ids.get(event_id, [])
+    }
     cited_event_ids = {event_id for memory in cited_memories for event_id in memory.source_event_ids}
     covered_fact_ids = sorted(required_fact_ids & cited_fact_ids)
     covered_event_ids = sorted(supporting_event_ids & cited_event_ids)
+
+    if query.gold.is_abstention:
+        fact_evidence_coverage = not cited_memories
+        evidence_correct = not cited_memories
+        answer_correct = answer_is_abstention(answer_text)
+        answer_success = answer_correct and evidence_correct
+        memory_precision = 1.0 if not cited_memories else 0.0
+        memory_recall = 1.0
+        breakdown = compute_time_breakdown(
+            required_fact_ids=query.gold.required_fact_ids,
+            fact_lifecycles=fact_lifecycles,
+            answer_completed_at_ms=answer_completed_at_ms,
+            answer_success=answer_success,
+        )
+        return QueryMetricRecord(
+            episode_id=query.episode_id,
+            query_id=query.query_id,
+            query_timestamp_ms=float(query.timestamp_ms),
+            answer_success=answer_success,
+            answer_correct=answer_correct,
+            evidence_correct=evidence_correct,
+            fact_evidence_coverage=fact_evidence_coverage,
+            memory_precision=memory_precision,
+            memory_recall=memory_recall,
+            cited_memory_ids=[memory.memory_id for memory in cited_memories],
+            retrieved_memory_ids=retrieved_memory_ids,
+            required_fact_ids=query.gold.required_fact_ids,
+            supporting_event_ids=query.gold.supporting_event_ids,
+            covered_fact_ids=covered_fact_ids,
+            covered_event_ids=covered_event_ids,
+            debug_contains_answer_facts=_contains_all_answer_facts(answer_text, query.gold.answer_facts),
+            answer_text=answer_text,
+            **breakdown,
+        )
+
     fact_evidence_coverage = required_fact_ids.issubset(cited_fact_ids)
     evidence_correct = fact_evidence_coverage and supporting_event_ids.issubset(cited_event_ids)
     answer_correct = answer_satisfies_gold_facts(answer_text, query.gold.answer_facts)
@@ -172,7 +213,11 @@ def evaluate_query_result(
     useful_retrieved_count = sum(
         1
         for memory in cited_memories
-        if required_fact_ids.intersection(memory.fact_ids)
+        if required_fact_ids.intersection(
+            fact_id
+            for event_id in memory.source_event_ids
+            for fact_id in event_fact_ids.get(event_id, [])
+        )
         or supporting_event_ids.intersection(memory.source_event_ids)
     )
     memory_precision = _safe_div(useful_retrieved_count, len(cited_memories))
@@ -421,6 +466,34 @@ def answer_satisfies_gold_facts(answer_text: str, answer_facts: list[str]) -> bo
         if coverage < 0.65:
             return False
     return True
+
+
+def answer_is_abstention(answer_text: str) -> bool:
+    """Return whether an answer clearly abstains from unsupported memory."""
+
+    normalized = _normalize_debug_text(answer_text)
+    markers = [
+        "do not know",
+        "don't know",
+        "not enough information",
+        "not enough info",
+        "insufficient information",
+        "not mentioned",
+        "cannot answer",
+        "can't answer",
+        "no information",
+        "unknown",
+    ]
+    return any(marker in normalized for marker in markers)
+
+
+def _event_fact_ids_from_lifecycles(
+    fact_lifecycles: dict[str, FactLifecycle],
+) -> dict[str, list[str]]:
+    by_event: dict[str, list[str]] = {}
+    for fact_id, lifecycle in fact_lifecycles.items():
+        by_event.setdefault(lifecycle.source_event_id, []).append(fact_id)
+    return by_event
 
 
 def _normalize_debug_text(value: str) -> str:

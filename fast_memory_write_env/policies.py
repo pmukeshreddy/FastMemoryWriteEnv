@@ -19,6 +19,19 @@ from fast_memory_write_env.schemas import (
 )
 
 
+POLICY_SAFE_METADATA_KEYS = {
+    "dataset",
+    "dataset_format",
+    "role",
+    "session_date",
+    "session_id",
+    "session_index",
+    "source_dataset",
+    "speaker",
+    "turn_index",
+}
+
+
 class MemoryWritePolicy(Protocol):
     """Policy interface for proposing memory-write actions."""
 
@@ -77,7 +90,7 @@ class LLMMemoryWritePolicy:
             last_content = response.content
             try:
                 payload = response.parsed_json if response.parsed_json is not None else _parse_json_payload(last_content)
-                return _validate_action_payload(payload)
+                return _strip_llm_hidden_fact_ids(_validate_action_payload(payload))
             except (json.JSONDecodeError, ValidationError, ValueError) as exc:
                 last_error = exc
                 if attempt >= self.max_retries:
@@ -112,9 +125,9 @@ class LLMMemoryWritePolicy:
             "ignore_event, compress_memory, index_now, delay_index."
         )
         user_payload = {
-            "new_event": new_event.model_dump(mode="json"),
-            "active_memories": [memory.model_dump(mode="json") for memory in active_memories],
-            "recent_events": [event.model_dump(mode="json") for event in recent_events],
+            "new_event": policy_visible_event(new_event),
+            "active_memories": [policy_visible_memory(memory) for memory in active_memories],
+            "recent_events": [policy_visible_event(event) for event in recent_events],
             "budgets": budget.model_dump(mode="json"),
             "response_contract": {
                 "shape": {"actions": ["memory action objects"]},
@@ -125,6 +138,7 @@ class LLMMemoryWritePolicy:
                     "Use ignore_event for noise or low-value duplicates.",
                     "Use index_now or action index_immediately only when indexing budget allows.",
                     "Use delay_index when memory should exist but not be indexed yet.",
+                    "Do not include fact_ids; evaluator-only fact labels are hidden and will be ignored.",
                 ],
             },
         }
@@ -273,6 +287,59 @@ def _validate_action_payload(payload: Any) -> list[MemoryAction]:
     else:
         actions = payload
     return validate_memory_actions(actions)
+
+
+def policy_visible_event(event: RawEvent) -> dict[str, Any]:
+    """Return the event payload visible to the memory-write policy."""
+
+    return {
+        "event_id": event.event_id,
+        "episode_id": event.episode_id,
+        "timestamp_ms": event.timestamp_ms,
+        "source": event.source,
+        "user_id": event.user_id,
+        "entity_id": event.entity_id,
+        "content": event.content,
+        "estimated_tokens": event.estimated_tokens,
+        "metadata": _safe_policy_metadata(event.metadata),
+    }
+
+
+def policy_visible_memory(memory: MemoryRecord) -> dict[str, Any]:
+    """Return the active-memory payload visible to the memory-write policy."""
+
+    return {
+        "memory_id": memory.memory_id,
+        "entity_id": memory.entity_id,
+        "content": memory.content,
+        "source_event_ids": list(memory.source_event_ids),
+        "created_at_ms": memory.created_at_ms,
+        "updated_at_ms": memory.updated_at_ms,
+        "status": memory.status.value,
+        "indexed": memory.indexed,
+        "estimated_tokens": memory.estimated_tokens,
+        "metadata": _safe_policy_metadata(memory.metadata),
+    }
+
+
+def _strip_llm_hidden_fact_ids(actions: list[MemoryAction]) -> list[MemoryAction]:
+    stripped: list[MemoryAction] = []
+    for action in actions:
+        if hasattr(action, "fact_ids"):
+            stripped.append(action.model_copy(update={"fact_ids": []}))
+        else:
+            stripped.append(action)
+    return stripped
+
+
+def _safe_policy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if key not in POLICY_SAFE_METADATA_KEYS:
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            safe[key] = value
+    return safe
 
 
 def build_memory_context(

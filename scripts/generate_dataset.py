@@ -9,13 +9,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fast_memory_write_env.dataset import generate_dataset
+from fast_memory_write_env.dataset import SYNTHETIC_DATASET_MODES, generate_dataset
 from fast_memory_write_env.schemas import DatasetMode
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate FastMemoryWriteEnv streaming dataset JSON.")
-    parser.add_argument("--mode", choices=[mode.value for mode in DatasetMode], default=DatasetMode.SMALL.value)
+    parser.add_argument("--mode", choices=[mode.value for mode in SYNTHETIC_DATASET_MODES], default=DatasetMode.SMALL.value)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="results/dataset.json")
     args = parser.parse_args()

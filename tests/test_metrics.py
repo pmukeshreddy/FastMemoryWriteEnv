@@ -22,7 +22,7 @@ from fast_memory_write_env.metrics import (
     write_rollout_jsonl,
 )
 from fast_memory_write_env.policies import LLMMemoryWritePolicy
-from fast_memory_write_env.schemas import DatasetMode, MemoryRecord, Query
+from fast_memory_write_env.schemas import DatasetMode, MemoryRecord, Query, QueryGold
 
 
 def _query_and_gold_event():
@@ -92,6 +92,36 @@ def test_query_scoring_separates_answer_text_from_evidence_coverage() -> None:
     assert metric.time_to_useful_memory is not None
 
 
+def test_query_scoring_uses_hidden_event_evidence_when_memory_fact_ids_are_empty() -> None:
+    query, event = _query_and_gold_event()
+    memory = _memory_for_query(query).model_copy(update={"fact_ids": []})
+    fact_lifecycles = {
+        fact_id: FactLifecycle(
+            fact_id=fact_id,
+            source_event_id=event.event_id,
+            event_timestamp_ms=float(event.timestamp_ms),
+            raw_written_at_ms=float(event.timestamp_ms + 1),
+            memory_written_at_ms=float(event.timestamp_ms + 5),
+            indexed_at_ms=float(event.timestamp_ms + 8),
+            retrieved_at_ms=float(query.timestamp_ms + 3),
+        )
+        for fact_id in query.gold.required_fact_ids
+    }
+
+    metric = evaluate_query_result(
+        query=query,
+        cited_memories=[memory],
+        retrieved_memory_ids=[memory.memory_id],
+        fact_lifecycles=fact_lifecycles,
+        answer_text=query.gold.answer_facts[0],
+        answer_completed_at_ms=float(query.timestamp_ms + 6),
+    )
+
+    assert metric.answer_success is True
+    assert metric.covered_fact_ids == query.gold.required_fact_ids
+    assert metric.memory_recall == 1.0
+
+
 def test_unrelated_answer_text_does_not_pass_answer_correctness() -> None:
     query, event = _query_and_gold_event()
     memory = _memory_for_query(query)
@@ -122,6 +152,41 @@ def test_unrelated_answer_text_does_not_pass_answer_correctness() -> None:
     assert metric.answer_correct is False
     assert metric.answer_success is False
     assert metric.time_to_useful_memory is None
+
+
+def test_abstention_query_succeeds_only_with_abstention_and_no_citations() -> None:
+    query, _ = _query_and_gold_event()
+    abstention_query = query.model_copy(
+        update={
+            "gold": QueryGold(is_abstention=True, notes="No evidence exists."),
+        }
+    )
+
+    metric = evaluate_query_result(
+        query=abstention_query,
+        cited_memories=[],
+        retrieved_memory_ids=[],
+        fact_lifecycles={},
+        answer_text="I do not know from indexed memory.",
+        answer_completed_at_ms=float(query.timestamp_ms + 6),
+    )
+
+    assert metric.answer_success is True
+    assert metric.answer_correct is True
+    assert metric.evidence_correct is True
+
+    cited_metric = evaluate_query_result(
+        query=abstention_query,
+        cited_memories=[_memory_for_query(query)],
+        retrieved_memory_ids=["mem-useful"],
+        fact_lifecycles={},
+        answer_text="I do not know from indexed memory.",
+        answer_completed_at_ms=float(query.timestamp_ms + 6),
+    )
+
+    assert cited_metric.answer_correct is True
+    assert cited_metric.evidence_correct is False
+    assert cited_metric.answer_success is False
 
 
 def test_query_scoring_marks_missing_evidence_incorrect() -> None:
@@ -306,6 +371,7 @@ def test_streaming_evaluator_writes_required_outputs(tmp_path) -> None:
     assert (tmp_path / "results" / "raw_rollouts.jsonl").exists()
     assert (tmp_path / "results" / "metrics.csv").exists()
     assert (tmp_path / "results" / "eval_summary.json").exists()
+    assert (tmp_path / "results" / "predictions.jsonl").exists()
 
     records = read_rollout_jsonl(tmp_path / "results" / "raw_rollouts.jsonl")
     run_config = extract_run_config(records)
@@ -318,3 +384,11 @@ def test_streaming_evaluator_writes_required_outputs(tmp_path) -> None:
     assert run_config.backend_type == "in_memory_test"
     assert summary["run_config"]["dataset_mode"] == DatasetMode.SMALL.value
     assert any(record.record_type == "run_config" for record in records)
+    assert any(
+        record.record_type == "queue" and record.payload.get("queue_event") == "enqueued"
+        for record in records
+    )
+    assert any(
+        record.record_type == "queue" and record.payload.get("queue_event") == "completed"
+        for record in records
+    )

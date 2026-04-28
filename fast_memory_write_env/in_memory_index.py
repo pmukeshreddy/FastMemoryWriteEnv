@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from fast_memory_write_env.index import SearchResult, text_match_score
@@ -13,12 +14,15 @@ class InMemoryIndex:
 
     def __init__(self) -> None:
         self._memories: dict[str, MemoryRecord] = {}
+        self._lock = threading.RLock()
 
     def upsert(self, memory: MemoryRecord) -> None:
-        self._memories[memory.memory_id] = memory
+        with self._lock:
+            self._memories[memory.memory_id] = memory
 
     def delete(self, memory_id: str) -> None:
-        self._memories.pop(memory_id, None)
+        with self._lock:
+            self._memories.pop(memory_id, None)
 
     def search(
         self,
@@ -27,31 +31,34 @@ class InMemoryIndex:
         top_k: int = 5,
         filters: dict[str, Any] | None = None,
     ) -> list[SearchResult]:
-        filters = filters or {}
-        results: list[SearchResult] = []
-        for memory in self._memories.values():
-            if memory.status != MemoryStatus.ACTIVE:
-                continue
-            if not _matches_filters(memory, filters):
-                continue
-            score = text_match_score(query, memory.content)
-            if score <= 0.0:
-                continue
-            results.append(
-                SearchResult(
-                    memory_id=memory.memory_id,
-                    score=score,
-                    content=memory.content,
-                    metadata={
-                        "entity_id": memory.entity_id,
-                        "status": memory.status.value,
-                        "indexed": memory.indexed,
-                        **memory.metadata,
-                    },
-                    memory=memory,
+        with self._lock:
+            filters = filters or {}
+            results: list[SearchResult] = []
+            for memory in self._memories.values():
+                if memory.status != MemoryStatus.ACTIVE:
+                    continue
+                if not memory.indexed:
+                    continue
+                if not _matches_filters(memory, filters):
+                    continue
+                score = text_match_score(query, memory.content)
+                if score <= 0.0:
+                    continue
+                results.append(
+                    SearchResult(
+                        memory_id=memory.memory_id,
+                        score=score,
+                        content=memory.content,
+                        metadata={
+                            "entity_id": memory.entity_id,
+                            "status": memory.status.value,
+                            "indexed": memory.indexed,
+                            **memory.metadata,
+                        },
+                        memory=memory,
+                    )
                 )
-            )
-        return sorted(results, key=lambda result: (-result.score, result.memory_id))[:top_k]
+            return sorted(results, key=lambda result: (-result.score, result.memory_id))[:top_k]
 
 
 def _matches_filters(memory: MemoryRecord, filters: dict[str, Any]) -> bool:

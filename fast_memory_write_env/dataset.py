@@ -34,6 +34,7 @@ MODE_CONFIGS: dict[DatasetMode, ModeConfig] = {
     DatasetMode.MEDIUM: ModeConfig(episode_count=4, background_cycles=3, noise_events=5),
     DatasetMode.LONG: ModeConfig(episode_count=8, background_cycles=8, noise_events=12),
 }
+SYNTHETIC_DATASET_MODES = tuple(MODE_CONFIGS.keys())
 
 
 USERS = ["user-alpha", "user-bravo", "user-charlie", "user-delta", "user-echo"]
@@ -45,6 +46,8 @@ def generate_dataset(mode: DatasetMode | str = DatasetMode.SMALL, seed: int = 0)
     """Generate a deterministic dataset with streaming episodes."""
 
     dataset_mode = DatasetMode(mode)
+    if dataset_mode not in MODE_CONFIGS:
+        raise ValueError(f"unsupported synthetic dataset mode: {dataset_mode.value}")
     config = MODE_CONFIGS[dataset_mode]
     episodes = [
         generate_episode(dataset_mode, seed=seed, episode_index=episode_index)
@@ -71,6 +74,8 @@ def generate_episode(
     """Generate one deterministic streaming episode with interleaved queries."""
 
     dataset_mode = DatasetMode(mode)
+    if dataset_mode not in MODE_CONFIGS:
+        raise ValueError(f"unsupported synthetic dataset mode: {dataset_mode.value}")
     mode_offset = {DatasetMode.SMALL: 11, DatasetMode.MEDIUM: 23, DatasetMode.LONG: 37}[dataset_mode]
     rng = random.Random(seed * 1009 + episode_index * 97 + mode_offset)
     builder = _EpisodeBuilder(dataset_mode, seed, episode_index, rng)

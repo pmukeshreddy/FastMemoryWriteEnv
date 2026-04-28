@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from fast_memory_write_env.actions import WriteMemoryAction
@@ -13,7 +15,7 @@ from fast_memory_write_env.policies import (
     OraclePolicy,
     StoreEverythingBaseline,
 )
-from fast_memory_write_env.schemas import DatasetMode, EventCategory
+from fast_memory_write_env.schemas import DatasetMode, EventCategory, MemoryRecord
 from fast_memory_write_env.stores import MemoryStore, RawEventStore
 
 
@@ -49,6 +51,45 @@ def test_mock_policy_writes_and_indexes_useful_event() -> None:
     assert actions[0].source_event_ids == [event.event_id]
     assert actions[0].index_immediately is True
     assert len(client.calls) == 1
+
+
+def test_policy_prompt_hides_evaluator_labels_from_events_and_memories() -> None:
+    event = _event(EventCategory.CONTRADICTION)
+    recent = _event(EventCategory.STALE_UPDATE)
+    memory = MemoryRecord(
+        memory_id="mem-existing",
+        entity_id=event.entity_id,
+        content="Existing visible memory.",
+        source_event_ids=["event-secret"],
+        fact_ids=["fact-secret"],
+        created_at_ms=1,
+        updated_at_ms=2,
+        indexed=True,
+        estimated_tokens=3,
+        metadata={
+            "role": "user",
+            "evidence_label_source": "hidden",
+            "answer": "hidden",
+        },
+    )
+    client = MockLLMClient()
+
+    _policy(client).decide(
+        new_event=event,
+        active_memories=[memory],
+        recent_events=[recent],
+        latency_budget_ms=250,
+        storage_budget_tokens_remaining=1000,
+        indexing_budget_operations_remaining=1,
+    )
+
+    payload = json.loads(client.calls[0][-1].content)
+    hidden_event_keys = {"category", "facts", "duplicate_of", "contradicts", "supersedes", "tags", "priority"}
+    assert hidden_event_keys.isdisjoint(payload["new_event"])
+    assert hidden_event_keys.isdisjoint(payload["recent_events"][0])
+    assert "fact_ids" not in payload["active_memories"][0]
+    assert payload["active_memories"][0]["metadata"] == {"role": "user"}
+    assert "evidence_label_source" not in payload["new_event"]["metadata"]
 
 
 def test_mock_policy_ignores_noise_event() -> None:
@@ -129,6 +170,48 @@ def test_policy_repairs_schema_invalid_response() -> None:
 
     assert actions[0].action_type == "write_memory"
     assert actions[0].memory_id == "mem-repaired"
+
+
+def test_llm_returned_fact_ids_are_stripped_before_execution(tmp_path) -> None:
+    event = _event(EventCategory.USEFUL_FACT)
+    client = MockLLMClient(
+        responses=[
+            {
+                "actions": [
+                    {
+                        "action_type": "write_memory",
+                        "memory_id": "mem-fake-facts",
+                        "entity_id": event.entity_id,
+                        "content": event.content,
+                        "source_event_ids": [event.event_id],
+                        "fact_ids": ["fake-fact-id"],
+                        "index_immediately": True,
+                    }
+                ]
+            }
+        ]
+    )
+    env = FastMemoryWriteEnv(
+        raw_event_store=RawEventStore(tmp_path / "raw.sqlite"),
+        memory_store=MemoryStore(tmp_path / "memory.sqlite"),
+        retrieval_index=InMemoryIndex(),
+    )
+
+    actions = _policy(client).decide(
+        new_event=event,
+        active_memories=[],
+        recent_events=[],
+        latency_budget_ms=250,
+        storage_budget_tokens_remaining=1000,
+        indexing_budget_operations_remaining=1,
+    )
+    assert actions[0].fact_ids == []
+
+    env.execute_action({"action_type": "store_raw", "event": event.model_dump(mode="json")})
+    result = env.execute_action(actions[0])
+
+    assert result.success is True
+    assert env.memory_store.require("mem-fake-facts").fact_ids == []
 
 
 def test_policy_fails_after_retry_budget() -> None:

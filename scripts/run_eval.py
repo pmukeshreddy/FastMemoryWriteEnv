@@ -12,9 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fast_memory_write_env.dataset import generate_episode
+from fast_memory_write_env.dataset import SYNTHETIC_DATASET_MODES, generate_episode
 from fast_memory_write_env.evaluator import StreamingEvaluator, write_evaluation_outputs
 from fast_memory_write_env.llm_client import MockLLMClient, OpenAICompatibleLLMClient
+from fast_memory_write_env.longmemeval import load_longmemeval_episodes
 from fast_memory_write_env.metrics import RunConfig
 from fast_memory_write_env.policies import LLMMemoryWritePolicy
 from fast_memory_write_env.schemas import DatasetMode
@@ -22,7 +23,9 @@ from fast_memory_write_env.schemas import DatasetMode
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run FastMemoryWriteEnv evaluation.")
-    parser.add_argument("--mode", choices=[mode.value for mode in DatasetMode], default=DatasetMode.SMALL.value)
+    parser.add_argument("--dataset-format", choices=["synthetic", "longmemeval"], default="synthetic")
+    parser.add_argument("--dataset-path", help="Local LongMemEval JSON path when --dataset-format=longmemeval.")
+    parser.add_argument("--mode", choices=[mode.value for mode in SYNTHETIC_DATASET_MODES], default=DatasetMode.SMALL.value)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--episode-index", type=int, default=0)
     parser.add_argument("--mock", action="store_true", help="Use MockLLMClient.")
@@ -30,16 +33,24 @@ def main() -> None:
     parser.add_argument("--output-dir", default="results")
     args = parser.parse_args()
 
-    episode = generate_episode(DatasetMode(args.mode), seed=args.seed, episode_index=args.episode_index)
+    if args.dataset_format == "longmemeval":
+        if not args.dataset_path:
+            raise SystemExit("--dataset-path is required when --dataset-format=longmemeval")
+        episodes = load_longmemeval_episodes(args.dataset_path)
+        if args.episode_index < 0 or args.episode_index >= len(episodes):
+            raise SystemExit(f"--episode-index must be between 0 and {len(episodes) - 1}")
+        episode = episodes[args.episode_index]
+    else:
+        episode = generate_episode(DatasetMode(args.mode), seed=args.seed, episode_index=args.episode_index)
     llm_client = MockLLMClient() if args.mock else OpenAICompatibleLLMClient()
     policy = LLMMemoryWritePolicy(
         llm_client=llm_client,
     )
     use_test_index = bool(args.use_test_index or args.mock)
     run_config = RunConfig(
-        dataset_mode=args.mode,
-        seed=args.seed,
-        episode_index=args.episode_index,
+        dataset_mode=episode.mode.value,
+        seed=episode.seed,
+        episode_index=episode.metadata.get("item_index", args.episode_index),
         episode_id=episode.episode_id,
         policy_name=type(policy).__name__,
         llm_client_type=type(llm_client).__name__,
@@ -57,6 +68,10 @@ def main() -> None:
             "mock": args.mock,
             "use_test_index": args.use_test_index,
             "output_dir": args.output_dir,
+            "dataset_format": args.dataset_format,
+            "dataset_path": args.dataset_path,
+            "longmemeval_question_id": episode.metadata.get("longmemeval_question_id"),
+            "evidence_label_source": episode.metadata.get("evidence_label_source"),
         },
     )
     with tempfile.TemporaryDirectory(prefix="fmwe-eval-") as tmpdir:
@@ -76,6 +91,7 @@ def main() -> None:
     print(f"raw_rollouts={result.output_paths['raw_rollouts']}")
     print(f"metrics_csv={result.output_paths['metrics_csv']}")
     print(f"eval_summary={result.output_paths['eval_summary']}")
+    print(f"predictions_jsonl={result.output_paths['predictions_jsonl']}")
 
 
 if __name__ == "__main__":

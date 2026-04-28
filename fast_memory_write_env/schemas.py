@@ -23,6 +23,7 @@ class DatasetMode(str, Enum):
     SMALL = "small"
     MEDIUM = "medium"
     LONG = "long"
+    LONGMEMEVAL = "longmemeval"
 
 
 class StreamItemType(str, Enum):
@@ -104,11 +105,24 @@ class RawEvent(StrictBaseModel):
 class QueryGold(StrictBaseModel):
     """Gold facts and evidence expected to support an answer."""
 
-    required_fact_ids: list[str] = Field(min_length=1)
-    supporting_event_ids: list[str] = Field(min_length=1)
-    answer_facts: list[str] = Field(min_length=1)
+    required_fact_ids: list[str] = Field(default_factory=list)
+    supporting_event_ids: list[str] = Field(default_factory=list)
+    answer_facts: list[str] = Field(default_factory=list)
     stale_fact_ids: list[str] = Field(default_factory=list)
+    is_abstention: bool = False
     notes: str | None = None
+
+    @model_validator(mode="after")
+    def validate_non_abstention_gold(self) -> QueryGold:
+        if self.is_abstention:
+            return self
+        if not self.required_fact_ids:
+            raise ValueError("non-abstention query gold requires required_fact_ids")
+        if not self.supporting_event_ids:
+            raise ValueError("non-abstention query gold requires supporting_event_ids")
+        if not self.answer_facts:
+            raise ValueError("non-abstention query gold requires answer_facts")
+        return self
 
 
 class Query(StrictBaseModel):

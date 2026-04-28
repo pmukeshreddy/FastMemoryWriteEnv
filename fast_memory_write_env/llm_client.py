@@ -10,7 +10,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import Field
 
-from fast_memory_write_env.schemas import EventCategory, RawEvent, StrictBaseModel
+from fast_memory_write_env.schemas import StrictBaseModel
 
 
 class LLMClientError(RuntimeError):
@@ -131,33 +131,34 @@ class MockLLMClient:
 
 def _default_mock_plan(messages: list[LLMMessage]) -> dict[str, Any]:
     request = _extract_request_json(messages)
-    event = RawEvent.model_validate(request["new_event"])
+    event = request["new_event"]
     active_memories = list(request.get("active_memories", []))
     indexing_budget = int(request.get("budgets", {}).get("indexing_budget_operations_remaining", 0))
+    content = str(event.get("content", ""))
+    event_id = str(event.get("event_id", "event"))
+    entity_id = str(event.get("entity_id", "entity"))
 
-    if event.category in {EventCategory.NOISE, EventCategory.DUPLICATE}:
+    if _looks_low_value_or_duplicate(content):
         return {
             "actions": [
                 {
                     "action_type": "ignore_event",
-                    "event_id": event.event_id,
-                    "reason": f"{event.category.value} is not worth a durable memory.",
+                    "event_id": event_id,
+                    "reason": "Event appears low-value or duplicate from visible content.",
                 }
             ]
         }
 
-    fact_ids = [fact.fact_id for fact in event.facts]
-    if event.category in {EventCategory.CONTRADICTION, EventCategory.STALE_UPDATE} and active_memories:
+    if _looks_like_update(content) and active_memories:
         memory_id = str(active_memories[0]["memory_id"])
         return {
             "actions": [
                 {
                     "action_type": "update_memory",
                     "memory_id": memory_id,
-                    "content": event.content,
-                    "source_event_ids": [event.event_id],
-                    "fact_ids": fact_ids,
-                    "reason": "New event corrects or supersedes prior memory.",
+                    "content": content,
+                    "source_event_ids": [event_id],
+                    "reason": "Visible content appears to correct or supersede prior memory.",
                     "index_immediately": indexing_budget > 0,
                 }
             ]
@@ -165,18 +166,17 @@ def _default_mock_plan(messages: list[LLMMessage]) -> dict[str, Any]:
 
     return {
         "actions": [
-            {
-                "action_type": "write_memory",
-                "memory_id": f"mem-{event.event_id}",
-                "entity_id": event.entity_id,
-                "content": event.content,
-                "source_event_ids": [event.event_id],
-                "fact_ids": fact_ids,
-                "importance": 5 if event.category == EventCategory.URGENT_FACT else 3,
-                "index_immediately": indexing_budget > 0,
-            }
-        ]
-    }
+                {
+                    "action_type": "write_memory",
+                    "memory_id": f"mem-{event_id}",
+                    "entity_id": entity_id,
+                    "content": content,
+                    "source_event_ids": [event_id],
+                    "importance": 5 if "urgent" in content.lower() else 3,
+                    "index_immediately": indexing_budget > 0,
+                }
+            ]
+        }
 
 
 def _extract_request_json(messages: list[LLMMessage]) -> dict[str, Any]:
@@ -190,6 +190,26 @@ def _extract_request_json(messages: list[LLMMessage]) -> dict[str, Any]:
         if isinstance(payload, dict) and "new_event" in payload:
             return payload
     raise LLMClientError("MockLLMClient could not find policy request JSON")
+
+
+def _looks_low_value_or_duplicate(content: str) -> bool:
+    normalized = content.lower()
+    markers = [
+        "duplicate note",
+        "repeated",
+        "opened the dashboard",
+        "thank-you message",
+        "heartbeat check",
+        "without changes",
+        "unrelated",
+    ]
+    return any(marker in normalized for marker in markers)
+
+
+def _looks_like_update(content: str) -> bool:
+    normalized = content.lower()
+    markers = ["correction:", "instead of", "stale", "supersede", "supersedes", "now prefers"]
+    return any(marker in normalized for marker in markers)
 
 
 def _loads_json_or_none(content: str) -> Any | None:

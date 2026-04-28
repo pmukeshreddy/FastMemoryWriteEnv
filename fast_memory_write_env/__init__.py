@@ -2,6 +2,7 @@
 
 from fast_memory_write_env.dataset import generate_dataset, generate_episode
 from fast_memory_write_env.llm_client import MockLLMClient, OpenAICompatibleLLMClient
+from fast_memory_write_env.longmemeval import load_longmemeval_episodes
 from fast_memory_write_env.policies import LLMMemoryWritePolicy
 from fast_memory_write_env.schemas import DatasetMode, GeneratedDataset, StreamingEpisode
 
@@ -14,6 +15,7 @@ __all__ = [
     "StreamingEpisode",
     "generate_dataset",
     "generate_episode",
+    "load_longmemeval_episodes",
 ]
 
 __version__ = "0.1.0"

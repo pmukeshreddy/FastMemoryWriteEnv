@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -17,86 +18,93 @@ class RawEventStore:
     def __init__(self, sqlite_path: str | Path) -> None:
         self.sqlite_path = Path(sqlite_path)
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.sqlite_path)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def store(self, event: RawEvent) -> int:
         """Store one raw event and return storage token delta."""
 
         tokens = event.estimated_tokens or estimate_tokens(event.content)
         try:
-            with self._conn:
-                self._conn.execute(
-                    """
-                    INSERT INTO raw_events (
-                        event_id, episode_id, timestamp_ms, user_id, entity_id,
-                        category, estimated_tokens, payload_json
+            with self._lock:
+                with self._conn:
+                    self._conn.execute(
+                        """
+                        INSERT INTO raw_events (
+                            event_id, episode_id, timestamp_ms, user_id, entity_id,
+                            category, estimated_tokens, payload_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event.event_id,
+                            event.episode_id,
+                            event.timestamp_ms,
+                            event.user_id,
+                            event.entity_id,
+                            event.category.value,
+                            tokens,
+                            event.model_dump_json(),
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event.event_id,
-                        event.episode_id,
-                        event.timestamp_ms,
-                        event.user_id,
-                        event.entity_id,
-                        event.category.value,
-                        tokens,
-                        event.model_dump_json(),
-                    ),
-                )
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"raw event already exists: {event.event_id}") from exc
         return tokens
 
     def get(self, event_id: str) -> RawEvent | None:
-        row = self._conn.execute(
-            "SELECT payload_json FROM raw_events WHERE event_id = ?",
-            (event_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json FROM raw_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
         if row is None:
             return None
         return RawEvent.model_validate_json(row["payload_json"])
 
     def list_by_episode(self, episode_id: str) -> list[RawEvent]:
-        rows = self._conn.execute(
-            """
-            SELECT payload_json FROM raw_events
-            WHERE episode_id = ?
-            ORDER BY timestamp_ms, event_id
-            """,
-            (episode_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT payload_json FROM raw_events
+                WHERE episode_id = ?
+                ORDER BY timestamp_ms, event_id
+                """,
+                (episode_id,),
+            ).fetchall()
         return [RawEvent.model_validate_json(row["payload_json"]) for row in rows]
 
     def count(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) AS count FROM raw_events").fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS count FROM raw_events").fetchone()
         return int(row["count"])
 
     def _init_schema(self) -> None:
-        with self._conn:
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS raw_events (
-                    event_id TEXT PRIMARY KEY,
-                    episode_id TEXT NOT NULL,
-                    timestamp_ms INTEGER NOT NULL,
-                    user_id TEXT NOT NULL,
-                    entity_id TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    estimated_tokens INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS raw_events (
+                        event_id TEXT PRIMARY KEY,
+                        episode_id TEXT NOT NULL,
+                        timestamp_ms INTEGER NOT NULL,
+                        user_id TEXT NOT NULL,
+                        entity_id TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        estimated_tokens INTEGER NOT NULL,
+                        payload_json TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_raw_events_episode_time "
-                "ON raw_events (episode_id, timestamp_ms)"
-            )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_raw_events_episode_time "
+                    "ON raw_events (episode_id, timestamp_ms)"
+                )
 
 
 class MemoryStore:
@@ -105,37 +113,42 @@ class MemoryStore:
     def __init__(self, sqlite_path: str | Path) -> None:
         self.sqlite_path = Path(sqlite_path)
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.sqlite_path)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def create(self, memory: MemoryRecord) -> int:
         tokens = memory.estimated_tokens or estimate_tokens(memory.content)
         memory = memory.model_copy(update={"estimated_tokens": tokens})
         try:
-            with self._conn:
-                self._insert_or_replace(memory, replace=False)
+            with self._lock:
+                with self._conn:
+                    self._insert_or_replace(memory, replace=False)
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"memory already exists: {memory.memory_id}") from exc
         return tokens
 
     def upsert(self, memory: MemoryRecord) -> int:
-        existing = self.get(memory.memory_id)
-        tokens = memory.estimated_tokens or estimate_tokens(memory.content)
-        memory = memory.model_copy(update={"estimated_tokens": tokens})
-        with self._conn:
-            self._insert_or_replace(memory, replace=True)
-        previous_tokens = existing.estimated_tokens if existing else 0
-        return tokens - previous_tokens
+        with self._lock:
+            existing = self.get(memory.memory_id)
+            tokens = memory.estimated_tokens or estimate_tokens(memory.content)
+            memory = memory.model_copy(update={"estimated_tokens": tokens})
+            with self._conn:
+                self._insert_or_replace(memory, replace=True)
+            previous_tokens = existing.estimated_tokens if existing else 0
+            return tokens - previous_tokens
 
     def get(self, memory_id: str) -> MemoryRecord | None:
-        row = self._conn.execute(
-            "SELECT payload_json FROM memories WHERE memory_id = ?",
-            (memory_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json FROM memories WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
         if row is None:
             return None
         return MemoryRecord.model_validate_json(row["payload_json"])
@@ -147,20 +160,22 @@ class MemoryStore:
         return memory
 
     def list_all(self) -> list[MemoryRecord]:
-        rows = self._conn.execute(
-            "SELECT payload_json FROM memories ORDER BY created_at_ms, memory_id"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM memories ORDER BY created_at_ms, memory_id"
+            ).fetchall()
         return [MemoryRecord.model_validate_json(row["payload_json"]) for row in rows]
 
     def list_active(self) -> list[MemoryRecord]:
-        rows = self._conn.execute(
-            """
-            SELECT payload_json FROM memories
-            WHERE status = ?
-            ORDER BY created_at_ms, memory_id
-            """,
-            (MemoryStatus.ACTIVE.value,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT payload_json FROM memories
+                WHERE status = ?
+                ORDER BY created_at_ms, memory_id
+                """,
+                (MemoryStatus.ACTIVE.value,),
+            ).fetchall()
         return [MemoryRecord.model_validate_json(row["payload_json"]) for row in rows]
 
     def update_memory(
@@ -173,22 +188,23 @@ class MemoryStore:
         updated_at_ms: int,
         metadata: dict[str, Any] | None = None,
     ) -> tuple[MemoryRecord, int]:
-        existing = self.require(memory_id)
-        merged_metadata = dict(existing.metadata)
-        if metadata:
-            merged_metadata.update(metadata)
-        updated = existing.model_copy(
-            update={
-                "content": content,
-                "source_event_ids": _merge_unique(existing.source_event_ids, source_event_ids),
-                "fact_ids": _merge_unique(existing.fact_ids, fact_ids),
-                "updated_at_ms": max(updated_at_ms, existing.updated_at_ms),
-                "estimated_tokens": estimate_tokens(content),
-                "metadata": merged_metadata,
-            }
-        )
-        delta = self.upsert(updated)
-        return updated, delta
+        with self._lock:
+            existing = self.require(memory_id)
+            merged_metadata = dict(existing.metadata)
+            if metadata:
+                merged_metadata.update(metadata)
+            updated = existing.model_copy(
+                update={
+                    "content": content,
+                    "source_event_ids": _merge_unique(existing.source_event_ids, source_event_ids),
+                    "fact_ids": _merge_unique(existing.fact_ids, fact_ids),
+                    "updated_at_ms": max(updated_at_ms, existing.updated_at_ms),
+                    "estimated_tokens": estimate_tokens(content),
+                    "metadata": merged_metadata,
+                }
+            )
+            delta = self.upsert(updated)
+            return updated, delta
 
     def mark_status(
         self,
@@ -198,32 +214,34 @@ class MemoryStore:
         updated_at_ms: int,
         metadata: dict[str, Any] | None = None,
     ) -> MemoryRecord:
-        existing = self.require(memory_id)
-        merged_metadata = dict(existing.metadata)
-        if metadata:
-            merged_metadata.update(metadata)
-        indexed = existing.indexed if status == MemoryStatus.ACTIVE else False
-        updated = existing.model_copy(
-            update={
-                "status": status,
-                "indexed": indexed,
-                "updated_at_ms": max(updated_at_ms, existing.updated_at_ms),
-                "metadata": merged_metadata,
-            }
-        )
-        self.upsert(updated)
-        return updated
+        with self._lock:
+            existing = self.require(memory_id)
+            merged_metadata = dict(existing.metadata)
+            if metadata:
+                merged_metadata.update(metadata)
+            indexed = existing.indexed if status == MemoryStatus.ACTIVE else False
+            updated = existing.model_copy(
+                update={
+                    "status": status,
+                    "indexed": indexed,
+                    "updated_at_ms": max(updated_at_ms, existing.updated_at_ms),
+                    "metadata": merged_metadata,
+                }
+            )
+            self.upsert(updated)
+            return updated
 
     def set_indexed(self, memory_id: str, indexed: bool, updated_at_ms: int) -> MemoryRecord:
-        existing = self.require(memory_id)
-        updated = existing.model_copy(
-            update={
-                "indexed": indexed,
-                "updated_at_ms": max(updated_at_ms, existing.updated_at_ms),
-            }
-        )
-        self.upsert(updated)
-        return updated
+        with self._lock:
+            existing = self.require(memory_id)
+            updated = existing.model_copy(
+                update={
+                    "indexed": indexed,
+                    "updated_at_ms": max(updated_at_ms, existing.updated_at_ms),
+                }
+            )
+            self.upsert(updated)
+            return updated
 
     def delay_index(
         self,
@@ -233,18 +251,19 @@ class MemoryStore:
         reason: str,
         updated_at_ms: int,
     ) -> MemoryRecord:
-        existing = self.require(memory_id)
-        metadata = dict(existing.metadata)
-        metadata.update({"delayed_index_until_ms": retry_after_ms, "delay_index_reason": reason})
-        updated = existing.model_copy(
-            update={
-                "indexed": False,
-                "updated_at_ms": max(updated_at_ms, existing.updated_at_ms),
-                "metadata": metadata,
-            }
-        )
-        self.upsert(updated)
-        return updated
+        with self._lock:
+            existing = self.require(memory_id)
+            metadata = dict(existing.metadata)
+            metadata.update({"delayed_index_until_ms": retry_after_ms, "delay_index_reason": reason})
+            updated = existing.model_copy(
+                update={
+                    "indexed": False,
+                    "updated_at_ms": max(updated_at_ms, existing.updated_at_ms),
+                    "metadata": metadata,
+                }
+            )
+            self.upsert(updated)
+            return updated
 
     def _insert_or_replace(self, memory: MemoryRecord, *, replace: bool) -> None:
         statement = "INSERT OR REPLACE" if replace else "INSERT"
@@ -269,27 +288,28 @@ class MemoryStore:
         )
 
     def _init_schema(self) -> None:
-        with self._conn:
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memories (
-                    memory_id TEXT PRIMARY KEY,
-                    entity_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    indexed INTEGER NOT NULL,
-                    estimated_tokens INTEGER NOT NULL,
-                    created_at_ms INTEGER NOT NULL,
-                    updated_at_ms INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS memories (
+                        memory_id TEXT PRIMARY KEY,
+                        entity_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        indexed INTEGER NOT NULL,
+                        estimated_tokens INTEGER NOT NULL,
+                        created_at_ms INTEGER NOT NULL,
+                        updated_at_ms INTEGER NOT NULL,
+                        payload_json TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (status)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories (entity_id)"
-            )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (status)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories (entity_id)"
+                )
 
 
 def _merge_unique(left: list[str], right: list[str]) -> list[str]:
