@@ -177,6 +177,8 @@ class _AsyncMemoryWriteWorker:
             try:
                 self._process_item(item)
             except BaseException as exc:  # pragma: no cover - surfaced by stop()
+                import traceback
+                traceback.print_exc()
                 with self._error_lock:
                     if self._error is None:
                         self._error = exc
