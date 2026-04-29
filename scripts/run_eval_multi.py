@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Run a multi-episode streaming evaluation and aggregate metrics.
 
-Each synthetic small episode produces ~4 queries; medium/long produce more.
-``--samples N`` keeps loading episodes (varying seed and episode_index)
-until the total query count reaches N. Per-episode artifacts are written
-under ``<output_dir>/episode_<i>/`` and a combined aggregate is written at
-``<output_dir>/aggregate_summary.json``.
+Each ``sample`` is one full streaming episode: the LLM policy decides
+write/update/index/etc actions for the whole event stream, then every
+query in the episode is composed and judged independently. ``--samples 20``
+runs 20 distinct episodes (different seeds and/or episode_indices, never
+repeated), producing roughly 4*20 = 80 queries on the ``small`` mode.
+
+Per-episode artifacts land under ``<output_dir>/sample_<NN>/`` and a
+combined aggregate is written at ``<output_dir>/aggregate_summary.json``.
 """
 
 from __future__ import annotations
@@ -42,13 +45,18 @@ from fast_memory_write_env.schemas import DatasetMode, StreamingEpisode
 
 
 def _episode_iter(mode: DatasetMode, *, start_seed: int):
-    """Yield episodes by walking seeds and the dataset's episode_count per seed."""
+    """Yield ``(seed, episode_index, episode)`` tuples without repeats.
+
+    Walks seeds incrementally; for each seed yields every episode in the
+    generated dataset (``episode_count`` per mode). Each tuple is unique
+    because every (seed, episode_index) pair is hit at most once.
+    """
 
     seed = start_seed
     while True:
         dataset = generate_dataset(mode=mode, seed=seed)
         for episode in dataset.episodes:
-            yield episode
+            yield seed, episode.metadata.get("episode_index"), episode
         seed += 1
 
 
@@ -108,7 +116,7 @@ def _evaluate_one(
     episode: StreamingEpisode,
     use_test_index: bool,
     output_dir: Path,
-    episode_slot: int,
+    sample_slot: int,
     args,
 ):
     llm_client = MockLLMClient() if args.mock else OpenAICompatibleLLMClient()
@@ -116,7 +124,7 @@ def _evaluate_one(
     run_config = RunConfig(
         dataset_mode=episode.mode.value,
         seed=episode.seed,
-        episode_index=episode.metadata.get("item_index"),
+        episode_index=episode.metadata.get("episode_index"),
         episode_id=episode.episode_id,
         policy_name=type(policy).__name__,
         llm_client_type=type(llm_client).__name__,
@@ -133,10 +141,10 @@ def _evaluate_one(
         metadata={
             "mock": args.mock,
             "use_test_index": args.use_test_index,
-            "episode_slot": episode_slot,
+            "sample_slot": sample_slot,
         },
     )
-    episode_output = output_dir / f"episode_{episode_slot:02d}"
+    episode_output = output_dir / f"sample_{sample_slot:02d}"
     with tempfile.TemporaryDirectory(prefix="fmwe-eval-") as tmpdir:
         evaluator = (
             StreamingEvaluator.with_local_test_index(policy=policy, work_dir=tmpdir, run_config=run_config)
@@ -154,8 +162,13 @@ def _evaluate_one(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a multi-episode FastMemoryWriteEnv evaluation.")
     parser.add_argument("--mode", choices=[m.value for m in SYNTHETIC_DATASET_MODES], default=DatasetMode.SMALL.value)
-    parser.add_argument("--samples", type=int, default=20, help="Stop once total query count reaches this number.")
-    parser.add_argument("--max-episodes", type=int, default=50, help="Hard cap on episode count.")
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=20,
+        help="Number of distinct episodes to run. Each sample is one full streaming "
+        "episode; the runner never repeats a (seed, episode_index) pair.",
+    )
     parser.add_argument("--start-seed", type=int, default=7)
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--use-test-index", action="store_true")
@@ -164,6 +177,9 @@ def main() -> None:
     parser.add_argument("--storage-budget", type=int, default=10_000)
     parser.add_argument("--indexing-budget", type=int, default=3)
     args = parser.parse_args()
+
+    if args.samples < 1:
+        raise SystemExit("--samples must be >= 1")
 
     use_test_index = bool(args.use_test_index or args.mock)
     output_dir = Path(args.output_dir)
@@ -177,16 +193,21 @@ def main() -> None:
     all_counters: list[AggregateCounterSnapshot] = []
     all_diagnostics: list[dict] = []
     total_queries = 0
-    episodes_run = 0
+    seen_keys: set[tuple[int, int | None]] = set()
 
-    while total_queries < args.samples and episodes_run < args.max_episodes:
-        episode = next(iterator)
-        episodes_run += 1
+    for sample_slot in range(args.samples):
+        seed, episode_index, episode = next(iterator)
+        key = (seed, episode_index)
+        if key in seen_keys:
+            raise RuntimeError(
+                f"refusing to repeat sample (seed={seed}, episode_index={episode_index})"
+            )
+        seen_keys.add(key)
         result = _evaluate_one(
             episode=episode,
             use_test_index=use_test_index,
             output_dir=output_dir,
-            episode_slot=episodes_run - 1,
+            sample_slot=sample_slot,
             args=args,
         )
         ep_queries = len(result.query_metrics)
@@ -195,26 +216,32 @@ def main() -> None:
         all_counters.append(_extract_counters_from_records(result.rollout_records))
         all_diagnostics.append(
             {
+                "sample_slot": sample_slot,
+                "seed": seed,
+                "episode_index": episode_index,
                 "episode_id": result.episode_id,
                 "diagnostics": build_failure_diagnostics(result.query_metrics, result.rollout_records),
             }
         )
         per_episode_summaries.append(
             {
-                "episode_slot": episodes_run - 1,
+                "sample_slot": sample_slot,
+                "seed": seed,
+                "episode_index": episode_index,
                 "episode_id": result.episode_id,
-                "seed": episode.seed,
-                "episode_index": episode.metadata.get("item_index"),
                 "queries": ep_queries,
                 "score": result.score_breakdown.score,
                 "metrics": headline_metrics(result.aggregate_metrics),
             }
         )
         print(
-            f"[{episodes_run:02d}] episode={result.episode_id} "
+            f"[{sample_slot + 1:02d}/{args.samples:02d}] "
+            f"seed={seed} idx={episode_index} episode={result.episode_id} "
             f"queries={ep_queries} score={result.score_breakdown.score:.3f} "
             f"answer_success={result.aggregate_metrics.answer_success:.3f}"
         )
+
+    episodes_run = args.samples
 
     merged_counters = _merge_counters(all_counters)
     merged_aggregate = aggregate_metrics(all_query_metrics, merged_counters)
@@ -241,9 +268,12 @@ def main() -> None:
 
     summary = {
         "mode": mode.value,
-        "samples_target": args.samples,
+        "samples": args.samples,
         "episodes_run": episodes_run,
         "total_queries": total_queries,
+        "unique_sample_keys": [
+            {"seed": seed, "episode_index": idx} for seed, idx in sorted(seen_keys)
+        ],
         "aggregate": {
             "score": merged_score.score,
             "metrics": headline_metrics(merged_aggregate),
@@ -271,7 +301,7 @@ def main() -> None:
 
     print()
     print("=" * 72)
-    print(f"AGGREGATE: episodes={episodes_run} queries={total_queries}")
+    print(f"AGGREGATE: samples={args.samples} (distinct episodes) queries={total_queries}")
     print(f"  score                 = {merged_score.score:.3f}")
     print(f"  answer_success        = {merged_aggregate.answer_success:.3f}")
     print(f"  answer_correct        = {merged_aggregate.answer_correct:.3f}")
