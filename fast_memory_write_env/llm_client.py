@@ -36,7 +36,13 @@ class LLMResponse(StrictBaseModel):
 class LLMClient(Protocol):
     """Internal abstraction used by memory-write policies."""
 
-    def complete(self, messages: list[LLMMessage], *, temperature: float = 0.0) -> LLMResponse:
+    def complete(
+        self,
+        messages: list[LLMMessage],
+        *,
+        temperature: float = 0.0,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
         """Return one chat completion."""
 
 
@@ -63,12 +69,18 @@ class OpenAICompatibleLLMClient:
         self.model = model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         self.timeout_seconds = timeout_seconds
 
-    def complete(self, messages: list[LLMMessage], *, temperature: float = 0.0) -> LLMResponse:
+    def complete(
+        self,
+        messages: list[LLMMessage],
+        *,
+        temperature: float = 0.0,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
         payload = {
             "model": self.model,
             "messages": [message.model_dump() for message in messages],
             "temperature": temperature,
-            "response_format": {"type": "json_object"},
+            "response_format": response_format or {"type": "json_object"},
         }
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -89,7 +101,11 @@ class OpenAICompatibleLLMClient:
             raise LLMClientError(f"OpenAI-compatible request failed: {exc}") from exc
 
         try:
-            content = response_payload["choices"][0]["message"]["content"]
+            message = response_payload["choices"][0]["message"]
+            refusal = message.get("refusal")
+            if refusal:
+                raise LLMClientError(f"OpenAI-compatible response refused: {refusal}")
+            content = message["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMClientError("OpenAI-compatible response did not contain message content") from exc
 
@@ -101,10 +117,16 @@ class OpenAICompatibleLLMClient:
             raw=response_payload,
         )
 
-    def complete_json(self, messages: list[LLMMessage], *, temperature: float = 0.0) -> Any:
+    def complete_json(
+        self,
+        messages: list[LLMMessage],
+        *,
+        temperature: float = 0.0,
+        response_format: dict[str, Any] | None = None,
+    ) -> Any:
         """Return parsed JSON from an OpenAI-compatible chat completion."""
 
-        response = self.complete(messages, temperature=temperature)
+        response = self.complete(messages, temperature=temperature, response_format=response_format)
         if response.parsed_json is None:
             raise LLMClientError("OpenAI-compatible response content was not valid JSON")
         return response.parsed_json
@@ -116,9 +138,17 @@ class MockLLMClient:
     def __init__(self, responses: list[str | dict[str, Any] | list[Any]] | None = None) -> None:
         self._responses = list(responses or [])
         self.calls: list[list[LLMMessage]] = []
+        self.response_formats: list[dict[str, Any] | None] = []
 
-    def complete(self, messages: list[LLMMessage], *, temperature: float = 0.0) -> LLMResponse:
+    def complete(
+        self,
+        messages: list[LLMMessage],
+        *,
+        temperature: float = 0.0,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
         self.calls.append(messages)
+        self.response_formats.append(response_format)
         if self._responses:
             response = self._responses.pop(0)
             if isinstance(response, str):

@@ -172,6 +172,30 @@ def test_policy_repairs_schema_invalid_response() -> None:
     assert actions[0].memory_id == "mem-repaired"
 
 
+def test_policy_requests_strict_structured_output_schema() -> None:
+    event = _event(EventCategory.USEFUL_FACT)
+    client = MockLLMClient()
+
+    LLMMemoryWritePolicy(llm_client=client, max_retries=0).decide(
+        new_event=event,
+        active_memories=[],
+        recent_events=[],
+        latency_budget_ms=250,
+        storage_budget_tokens_remaining=1000,
+        indexing_budget_operations_remaining=1,
+    )
+
+    response_format = client.response_formats[0]
+    assert response_format is not None
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    write_memory_schema = schema["properties"]["actions"]["items"]["anyOf"][0]
+    assert "memory_id" in write_memory_schema["required"]
+
+
 def test_llm_returned_fact_ids_are_stripped_before_execution(tmp_path) -> None:
     event = _event(EventCategory.USEFUL_FACT)
     client = MockLLMClient(

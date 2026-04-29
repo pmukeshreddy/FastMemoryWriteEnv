@@ -13,6 +13,7 @@ from fast_memory_write_env.index import estimate_tokens
 from fast_memory_write_env.llm_client import LLMClient, LLMClientError, LLMMessage
 from fast_memory_write_env.schemas import (
     EventCategory,
+    ID_PATTERN,
     MemoryRecord,
     MemoryWriteBudget,
     RawEvent,
@@ -30,6 +31,105 @@ POLICY_SAFE_METADATA_KEYS = {
     "speaker",
     "turn_index",
 }
+
+
+def memory_action_response_format() -> dict[str, Any]:
+    """OpenAI Structured Outputs schema for validated memory actions."""
+
+    id_string = {"type": "string", "pattern": ID_PATTERN}
+    source_event_ids = {"type": "array", "items": id_string, "minItems": 1}
+    source_memory_ids = {"type": "array", "items": id_string, "minItems": 2}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "memory_write_actions",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "anyOf": [
+                                _strict_action_schema(
+                                    {
+                                        "action_type": {"type": "string", "enum": ["write_memory"]},
+                                        "memory_id": {
+                                            **id_string,
+                                            "description": "Stable memory ID. Use a mem- prefix.",
+                                        },
+                                        "entity_id": id_string,
+                                        "content": {"type": "string"},
+                                        "source_event_ids": source_event_ids,
+                                        "importance": {"type": "integer", "minimum": 1, "maximum": 5},
+                                        "index_immediately": {"type": "boolean"},
+                                    }
+                                ),
+                                _strict_action_schema(
+                                    {
+                                        "action_type": {"type": "string", "enum": ["update_memory"]},
+                                        "memory_id": id_string,
+                                        "content": {"type": "string"},
+                                        "source_event_ids": source_event_ids,
+                                        "reason": {"type": "string"},
+                                        "index_immediately": {"type": "boolean"},
+                                    }
+                                ),
+                                _strict_action_schema(
+                                    {
+                                        "action_type": {"type": "string", "enum": ["mark_stale"]},
+                                        "memory_id": id_string,
+                                        "reason": {"type": "string"},
+                                    }
+                                ),
+                                _strict_action_schema(
+                                    {
+                                        "action_type": {"type": "string", "enum": ["ignore_event"]},
+                                        "event_id": id_string,
+                                        "reason": {"type": "string"},
+                                    }
+                                ),
+                                _strict_action_schema(
+                                    {
+                                        "action_type": {"type": "string", "enum": ["compress_memory"]},
+                                        "source_memory_ids": source_memory_ids,
+                                        "target_memory_id": id_string,
+                                        "compressed_content": {"type": "string"},
+                                    }
+                                ),
+                                _strict_action_schema(
+                                    {
+                                        "action_type": {"type": "string", "enum": ["index_now"]},
+                                        "memory_id": id_string,
+                                    }
+                                ),
+                                _strict_action_schema(
+                                    {
+                                        "action_type": {"type": "string", "enum": ["delay_index"]},
+                                        "memory_id": id_string,
+                                        "retry_after_ms": {"type": "integer", "minimum": 0},
+                                        "reason": {"type": "string"},
+                                    }
+                                ),
+                            ]
+                        },
+                    }
+                },
+                "required": ["actions"],
+            },
+        },
+    }
+
+
+def _strict_action_schema(properties: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties),
+    }
 
 
 class MemoryWritePolicy(Protocol):
@@ -86,7 +186,11 @@ class LLMMemoryWritePolicy:
         last_content = ""
 
         for attempt in range(self.max_retries + 1):
-            response = self.llm_client.complete(messages, temperature=self.temperature)
+            response = self.llm_client.complete(
+                messages,
+                temperature=self.temperature,
+                response_format=memory_action_response_format(),
+            )
             last_content = response.content
             try:
                 payload = response.parsed_json if response.parsed_json is not None else _parse_json_payload(last_content)
@@ -103,6 +207,7 @@ class LLMMemoryWritePolicy:
                         content=(
                             "Repair the previous response. Return JSON only with this shape: "
                             '{"actions": [validated memory action objects]}. '
+                            "The active response_format JSON schema is strict; satisfy it exactly. "
                             f"Validation error: {exc}"
                         ),
                     ),
@@ -131,8 +236,35 @@ class LLMMemoryWritePolicy:
             "budgets": budget.model_dump(mode="json"),
             "response_contract": {
                 "shape": {"actions": ["memory action objects"]},
+                "required_fields_by_action_type": {
+                    "write_memory": [
+                        "action_type",
+                        "memory_id",
+                        "entity_id",
+                        "content",
+                        "source_event_ids",
+                    ],
+                    "update_memory": [
+                        "action_type",
+                        "memory_id",
+                        "content",
+                        "source_event_ids",
+                        "reason",
+                    ],
+                    "mark_stale": ["action_type", "memory_id", "reason"],
+                    "ignore_event": ["action_type", "event_id", "reason"],
+                    "compress_memory": [
+                        "action_type",
+                        "source_memory_ids",
+                        "target_memory_id",
+                        "compressed_content",
+                    ],
+                    "index_now": ["action_type", "memory_id"],
+                    "delay_index": ["action_type", "memory_id", "retry_after_ms", "reason"],
+                },
                 "notes": [
                     "Use write_memory for durable new facts.",
+                    "For write_memory, memory_id is required. Use a stable ID beginning with mem-.",
                     "Use update_memory for corrections to existing active memories.",
                     "Use mark_stale when old facts are superseded.",
                     "Use ignore_event for noise or low-value duplicates.",
