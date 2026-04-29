@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import tempfile
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -236,7 +237,11 @@ def _evaluate_one(
                 try:
                     cleanup_fn()
                 except Exception:
-                    pass
+                    print(
+                        "warning: per-sample retrieval cleanup raised:",
+                        file=sys.stderr,
+                    )
+                    traceback.print_exc()
     return result
 
 
@@ -433,6 +438,13 @@ def main() -> None:
                 }
             )
             samples_bar.update(1)
+            tqdm.write(
+                "".join(
+                    traceback.format_exception(
+                        type(payload), payload, payload.__traceback__
+                    )
+                )
+            )
             tqdm.write(
                 f"[{completion_index:02d}/{args.samples:02d}] slot={sample_slot:02d} "
                 f"seed={seed} idx={episode_index} FAILED: {err_text}"

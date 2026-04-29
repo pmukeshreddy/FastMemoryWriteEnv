@@ -13,6 +13,8 @@ during construction if they disagree.
 
 from __future__ import annotations
 
+import sys
+import traceback
 from typing import Any
 
 # Import the SDK once at module load (single-threaded). pinecone v7 uses
@@ -122,8 +124,15 @@ class PineconeIndex:
             self._index.delete(delete_all=True, namespace=self.config.namespace)
         except Exception:  # pragma: no cover - best-effort cleanup
             # Some Pinecone responses raise when the namespace is already
-            # empty. Swallow only here so a per-sample teardown is robust.
-            pass
+            # empty. Keep the teardown best-effort, but surface the cause
+            # so real failures (auth, network, API regression) are not
+            # silently hidden.
+            print(
+                f"warning: Pinecone cleanup_namespace failed for "
+                f"namespace={self.config.namespace!r}:",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
 
     def search(
         self,
