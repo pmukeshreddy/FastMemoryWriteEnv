@@ -42,8 +42,13 @@ POLICY_SAFE_METADATA_KEYS = {
 # event re-serialized into every call), which is the dominant per-event
 # latency cost on real LongMemEval workloads. The caps trade a small
 # amount of long-tail context for ~3-5x faster decide latency.
-POLICY_MAX_ACTIVE_MEMORIES = 8
-POLICY_MAX_RECENT_EVENTS = 2
+#
+# On real conversational data (LongMemEval) the previous tight caps
+# (2 recent events, 8 active memories) starved the policy of the context
+# it needed to recognize novel personal facts vs continuations and to
+# update existing memories instead of duplicating or ignoring them.
+POLICY_MAX_ACTIVE_MEMORIES = 24
+POLICY_MAX_RECENT_EVENTS = 10
 
 # Cap the per-decision action list. Production LongMemEval turns rarely
 # need more than two or three coordinated actions per event. A hard upper
@@ -271,15 +276,49 @@ class LLMMemoryWritePolicy:
         )[:POLICY_MAX_ACTIVE_MEMORIES]
         trimmed_recent = list(recent_events)[-POLICY_MAX_RECENT_EVENTS:]
         system = (
-            "You are LLMMemoryWritePolicy for FastMemoryWriteEnv. "
-            "Decide what memory actions to propose for the new raw event under the budgets. "
-            "Return JSON only. Do not call tools, stores, or indexes. "
-            "Allowed action_type values: write_memory, update_memory, mark_stale, "
-            "ignore_event, compress_memory, index_now, delay_index. "
-            "The environment owns memory IDs: never include memory_id on write_memory or "
-            "target_memory_id on compress_memory. Existing-memory actions may only reference "
-            "memory_ids that appear in active_memories. "
-            f"Emit at most {POLICY_MAX_ACTIONS_PER_DECISION} actions per response; "
+            "You are LLMMemoryWritePolicy for FastMemoryWriteEnv. Your job is to build "
+            "memory that lets a future query answer questions about this user/entity "
+            "correctly. Decide what memory actions to propose for the new raw event "
+            "under the budgets.\n"
+            "\n"
+            "WHAT TO REMEMBER (write_memory or update_memory):\n"
+            "- Personal facts and self-disclosures: name, age, education (\"degree in X\"), "
+            "  job/role, employer, location, family, relationships, health conditions, "
+            "  identities, demographics.\n"
+            "- Preferences and opinions the user states as theirs: likes, dislikes, "
+            "  favorite X, hates Y, prefers Z over W.\n"
+            "- Decisions, plans, goals, and commitments: \"I'm going to...\", \"I just "
+            "  bought...\", \"I'm starting...\", deadlines, scheduled events.\n"
+            "- Specific named entities the user owns or interacts with: pet names, "
+            "  product names, project names, places they go, people they know.\n"
+            "- Numerical/temporal facts: dates, durations, prices, ages, scores.\n"
+            "- Problems the user is solving and constraints they have.\n"
+            "When in doubt about long-term value, prefer write_memory over ignore_event. "
+            "It is far worse to lose a fact the future query needs than to store an "
+            "extra one. Always cite the new event's event_id in source_event_ids.\n"
+            "\n"
+            "WHAT TO IGNORE (ignore_event):\n"
+            "- Pure acknowledgments, greetings, and chit-chat with no information "
+            "  (\"thanks\", \"ok\", \"sounds good\", \"how's it going\").\n"
+            "- Generic AI/assistant replies that just restate the user's message.\n"
+            "- Boilerplate, marketing copy, or content the user is reading aloud "
+            "  rather than asserting.\n"
+            "- Exact duplicates of an existing active_memory that need no update.\n"
+            "\n"
+            "PREFER update_memory OVER write_memory when an existing active memory "
+            "already covers the same subject and the new event refines or supersedes "
+            "it (correction, clarification, change of state). Use mark_stale only when "
+            "an old memory is fully superseded by a different existing memory. Use "
+            "compress_memory to merge several related delayed memories into one.\n"
+            "\n"
+            "OUTPUT RULES:\n"
+            "- Return JSON only. Do not call tools, stores, or indexes.\n"
+            "- Allowed action_type values: write_memory, update_memory, mark_stale, "
+            "  ignore_event, compress_memory, index_now, delay_index.\n"
+            "- The environment owns memory IDs: never include memory_id on write_memory "
+            "  or target_memory_id on compress_memory. Existing-memory actions may only "
+            "  reference memory_ids that appear in active_memories.\n"
+            f"- Emit at most {POLICY_MAX_ACTIONS_PER_DECISION} actions per response; "
             "prefer one or two focused actions over long action lists."
         )
         user_payload = {
