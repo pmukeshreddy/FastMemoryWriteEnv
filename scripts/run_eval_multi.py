@@ -218,6 +218,7 @@ def _evaluate_one(
         evaluator.worker_stop_timeout_seconds = args.worker_stop_timeout_seconds
         evaluator.show_inner_progress = show_inner
         evaluator.debug_timing = args.debug_timing
+        evaluator.write_worker_concurrency = args.write_worker_concurrency
         try:
             result = evaluator.evaluate_episode(episode)
             result = write_evaluation_outputs(result, episode_output)
@@ -309,6 +310,16 @@ def main() -> None:
         action="store_true",
         help="Print per-event and per-query wall-clock timings (decide / "
         "compose / judge) to surface which step is the bottleneck.",
+    )
+    parser.add_argument(
+        "--write-worker-concurrency",
+        type=int,
+        default=4,
+        help="Number of memory-write worker threads inside each sample. "
+        "Each thread pulls events from the queue and runs the policy "
+        "LLM call concurrently (commits serialise through env._lock). "
+        "Set to 1 for strict ordering; >1 trades exact ordering of the "
+        "active_memories snapshot for parallel LLM throughput.",
     )
     args = parser.parse_args()
 

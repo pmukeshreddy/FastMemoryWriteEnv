@@ -81,7 +81,23 @@ class EvaluationResult(StrictBaseModel):
 
 
 class _AsyncMemoryWriteWorker:
-    """Background worker that turns queued raw events into memory actions."""
+    """Background worker pool that turns queued raw events into memory actions.
+
+    The pool runs ``worker_concurrency`` threads against a single
+    ``MemoryWriteQueue``. Each thread pulls one event at a time, calls
+    ``policy.decide`` (slow LLM round-trip), then commits the resulting
+    actions through the env (fast, lock-serialized). Multiple threads can
+    have LLM calls in flight at once; commits serialize through the env's
+    own RLock so memory_store/retrieval_index mutations stay consistent.
+
+    With ``worker_concurrency=1`` this collapses to the original strict
+    single-threaded behaviour: one event at a time, fully ordered. With
+    >1 the system accepts eventual consistency on the active_memories
+    snapshot — two near-simultaneous events may each see slightly
+    different snapshots and write overlapping memories. This matches how
+    Mem0/Zep handle concurrent extraction; the LLM policy can clean up
+    duplicates afterwards via ``compress_memory``.
+    """
 
     def __init__(
         self,
@@ -100,6 +116,7 @@ class _AsyncMemoryWriteWorker:
         indexed_memory_available_at_ms: dict[str, float],
         state_lock: threading.RLock,
         debug_timing: bool = False,
+        worker_concurrency: int = 1,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -114,23 +131,38 @@ class _AsyncMemoryWriteWorker:
         self.counters = counters
         self.indexed_memory_available_at_ms = indexed_memory_available_at_ms
         self.state_lock = state_lock
-        self.logical_time_ms = 0.0
         self.debug_timing = debug_timing
+        if worker_concurrency < 1:
+            raise ValueError("worker_concurrency must be >= 1")
+        self.worker_concurrency = worker_concurrency
         self._error: BaseException | None = None
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"memory-write-worker-{episode_id}",
-            daemon=True,
-        )
+        self._error_lock = threading.Lock()
+        self._threads = [
+            threading.Thread(
+                target=self._run,
+                name=f"memory-write-worker-{episode_id}-{worker_index}",
+                daemon=True,
+            )
+            for worker_index in range(worker_concurrency)
+        ]
 
     def start(self) -> None:
-        self._thread.start()
+        for thread in self._threads:
+            thread.start()
 
     def stop(self, timeout_seconds: float | None = None) -> None:
         self.queue.close()
-        self._thread.join(timeout=timeout_seconds)
-        if self._thread.is_alive():
-            raise TimeoutError("memory-write worker did not stop before timeout")
+        deadline = (
+            None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        )
+        for thread in self._threads:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            thread.join(timeout=remaining)
+        for thread in self._threads:
+            if thread.is_alive():
+                raise TimeoutError("memory-write worker did not stop before timeout")
         if self._error is not None:
             raise RuntimeError("memory-write worker failed") from self._error
 
@@ -144,14 +176,20 @@ class _AsyncMemoryWriteWorker:
             try:
                 self._process_item(item)
             except BaseException as exc:  # pragma: no cover - surfaced by stop()
-                self._error = exc
+                with self._error_lock:
+                    if self._error is None:
+                        self._error = exc
                 return
             finally:
                 self.queue.task_done()
 
     def _process_item(self, queue_item: Any) -> None:
-        started_at_ms = max(self.logical_time_ms, float(queue_item.enqueued_at_ms))
-        self.logical_time_ms = started_at_ms
+        # Per-event local logical clock. With concurrent workers we cannot
+        # share a single ``self.logical_time_ms`` accumulator across events;
+        # each event starts at its own enqueued time and advances only by
+        # the latencies of its own actions.
+        started_at_ms = float(queue_item.enqueued_at_ms)
+        logical_time_ms = started_at_ms
         with self.state_lock:
             budget_snapshot = self.env.budget_snapshot()
             self.records.append(
@@ -159,7 +197,7 @@ class _AsyncMemoryWriteWorker:
                     record_type="queue",
                     episode_id=self.episode_id,
                     timestamp_ms=float(queue_item.event.timestamp_ms),
-                    logical_time_ms=self.logical_time_ms,
+                    logical_time_ms=logical_time_ms,
                     payload={
                         "event_id": queue_item.event.event_id,
                         "queue_item_id": queue_item.queue_item_id,
@@ -204,7 +242,7 @@ class _AsyncMemoryWriteWorker:
                         record_type="action",
                         episode_id=self.episode_id,
                         timestamp_ms=float(queue_item.event.timestamp_ms),
-                        logical_time_ms=self.logical_time_ms,
+                        logical_time_ms=logical_time_ms,
                         payload={
                             "policy_plan_error": str(exc),
                             "event_id": queue_item.event.event_id,
@@ -216,15 +254,15 @@ class _AsyncMemoryWriteWorker:
         decide_elapsed = time.monotonic() - decide_started
         actions_started = time.monotonic()
         for action in actions:
-            result = self.env.execute_action_at(action, current_time_ms=int(self.logical_time_ms))
-            self.logical_time_ms += result.latency_ms
+            result = self.env.execute_action_at(action, current_time_ms=int(logical_time_ms))
+            logical_time_ms += result.latency_ms
             action_payload = action.model_dump(mode="json")
             with self.state_lock:
                 self.records.append(
                     _action_record(
                         self.episode_id,
                         queue_item.event.timestamp_ms,
-                        self.logical_time_ms,
+                        logical_time_ms,
                         result,
                         proposed_action=action_payload,
                     )
@@ -234,7 +272,7 @@ class _AsyncMemoryWriteWorker:
                         action_type=result.action_type.value,
                         result_payload=result.payload,
                         indexed_memory_available_at_ms=self.indexed_memory_available_at_ms,
-                        logical_time_ms=self.logical_time_ms,
+                        logical_time_ms=logical_time_ms,
                     )
                     _update_timelines_for_action(
                         action_type=result.action_type.value,
@@ -242,7 +280,7 @@ class _AsyncMemoryWriteWorker:
                         result_payload=result.payload,
                         env=self.env,
                         fact_lifecycles=self.fact_lifecycles,
-                        logical_time_ms=self.logical_time_ms,
+                        logical_time_ms=logical_time_ms,
                     )
                     _update_latency_counters(result.action_type.value, result.latency_ms, result.payload, self.counters)
                 if (
@@ -270,12 +308,12 @@ class _AsyncMemoryWriteWorker:
                     record_type="queue",
                     episode_id=self.episode_id,
                     timestamp_ms=float(queue_item.event.timestamp_ms),
-                    logical_time_ms=self.logical_time_ms,
+                    logical_time_ms=logical_time_ms,
                     payload={
                         "event_id": queue_item.event.event_id,
                         "queue_item_id": queue_item.queue_item_id,
                         "queue_event": "completed",
-                        "completed_at_ms": self.logical_time_ms,
+                        "completed_at_ms": logical_time_ms,
                         "pending_event_ids": self.queue.pending_event_ids(),
                     },
                 )
@@ -300,6 +338,7 @@ class StreamingEvaluator:
         worker_stop_timeout_seconds: float = 1800.0,
         show_inner_progress: bool = True,
         debug_timing: bool = False,
+        write_worker_concurrency: int = 1,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -321,6 +360,9 @@ class StreamingEvaluator:
         # samples bar updates.
         self.show_inner_progress = show_inner_progress
         self.debug_timing = debug_timing or os.environ.get("FMWE_DEBUG_TIMING") == "1"
+        if write_worker_concurrency < 1:
+            raise ValueError("write_worker_concurrency must be >= 1")
+        self.write_worker_concurrency = write_worker_concurrency
         # Default the answer-correctness judge to the policy's LLM client when
         # one is available (LLMMemoryWritePolicy exposes ``llm_client``).
         # Baselines and rule-based test policies have no client, so scoring
@@ -460,6 +502,7 @@ class StreamingEvaluator:
             indexed_memory_available_at_ms=indexed_memory_available_at_ms,
             state_lock=state_lock,
             debug_timing=self.debug_timing,
+            worker_concurrency=self.write_worker_concurrency,
         )
         records.append(
             RolloutRecord(
