@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import time
 import urllib.error
 import urllib.request
@@ -63,9 +64,9 @@ class OpenAICompatibleLLMClient:
         base_url: str | None = None,
         model: str | None = None,
         timeout_seconds: float = 30.0,
-        max_retries: int = 5,
+        max_retries: int = 12,
         retry_initial_seconds: float = 1.0,
-        retry_max_seconds: float = 30.0,
+        retry_max_seconds: float = 90.0,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -115,7 +116,7 @@ class OpenAICompatibleLLMClient:
             except urllib.error.HTTPError as exc:
                 err_body = exc.read().decode("utf-8", errors="replace")
                 if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
-                    sleep_seconds = self._retry_delay_seconds(exc, attempt)
+                    sleep_seconds = self._retry_delay_seconds(exc, attempt, err_body=err_body)
                     time.sleep(sleep_seconds)
                     last_error = exc
                     continue
@@ -124,7 +125,7 @@ class OpenAICompatibleLLMClient:
                 ) from exc
             except (urllib.error.URLError, TimeoutError) as exc:
                 if attempt < self.max_retries:
-                    time.sleep(self._retry_delay_seconds(None, attempt))
+                    time.sleep(self._retry_delay_seconds(None, attempt, err_body=None))
                     last_error = exc
                     continue
                 raise LLMClientError(f"OpenAI-compatible request failed: {exc}") from exc
@@ -156,17 +157,24 @@ class OpenAICompatibleLLMClient:
         self,
         exc: urllib.error.HTTPError | None,
         attempt: int,
+        *,
+        err_body: str | None = None,
     ) -> float:
-        """Exponential backoff with jitter, honouring ``Retry-After`` if present."""
+        """Wait time honouring server hints, with full-jitter exponential fallback.
 
-        if exc is not None:
-            retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            if retry_after:
-                try:
-                    delay = float(retry_after)
-                    return min(self.retry_max_seconds, max(0.1, delay))
-                except ValueError:
-                    pass
+        OpenAI's TPM 429s do not always set ``Retry-After``. They reliably set
+        ``x-ratelimit-reset-tokens`` (e.g. ``"660ms"``, ``"1.5s"``) and put the
+        same hint in the JSON body (``"Please try again in 660ms"``). Honouring
+        these is the difference between a single retry succeeding and a thrash
+        loop blowing through the retry budget.
+        """
+
+        server_hint_seconds = _server_retry_hint_seconds(exc, err_body)
+        if server_hint_seconds is not None:
+            # Add proportional jitter so concurrent workers do not retry in
+            # lockstep and re-hit the bucket together (thundering herd).
+            jitter = random.uniform(0.0, max(0.25, server_hint_seconds * 0.5))
+            return min(self.retry_max_seconds, max(0.1, server_hint_seconds + jitter))
         backoff = self.retry_initial_seconds * (2 ** attempt)
         # Full jitter: pick uniformly in [0, backoff] then cap.
         return min(self.retry_max_seconds, random.uniform(0.0, backoff))
@@ -184,6 +192,60 @@ class OpenAICompatibleLLMClient:
         if response.parsed_json is None:
             raise LLMClientError("OpenAI-compatible response content was not valid JSON")
         return response.parsed_json
+
+
+_DURATION_RE = re.compile(r"^\s*([\d.]+)\s*(ms|s|m)?\s*$", re.IGNORECASE)
+_BODY_RETRY_HINT_RE = re.compile(
+    r"try again in\s*([\d.]+)\s*(ms|s|m)\b", re.IGNORECASE
+)
+
+
+def _parse_duration_seconds(raw: str | None) -> float | None:
+    """Parse OpenAI rate-limit duration strings like ``"660ms"`` / ``"1.5s"`` / ``"30"``."""
+
+    if raw is None:
+        return None
+    match = _DURATION_RE.match(raw)
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+    unit = (match.group(2) or "s").lower()
+    if unit == "ms":
+        return value / 1000.0
+    if unit == "s":
+        return value
+    if unit == "m":
+        return value * 60.0
+    return None
+
+
+def _server_retry_hint_seconds(
+    exc: urllib.error.HTTPError | None,
+    err_body: str | None,
+) -> float | None:
+    """Return the server's preferred wait, in seconds, if it gave one."""
+
+    if exc is not None and exc.headers is not None:
+        for header in (
+            "Retry-After",
+            "retry-after",
+            "x-ratelimit-reset-tokens",
+            "x-ratelimit-reset-requests",
+        ):
+            value = exc.headers.get(header)
+            parsed = _parse_duration_seconds(value)
+            if parsed is not None and parsed >= 0:
+                return parsed
+    if err_body:
+        match = _BODY_RETRY_HINT_RE.search(err_body)
+        if match:
+            parsed = _parse_duration_seconds(f"{match.group(1)}{match.group(2)}")
+            if parsed is not None and parsed >= 0:
+                return parsed
+    return None
 
 
 class MockLLMClient:
