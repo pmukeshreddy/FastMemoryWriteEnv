@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Protocol
 
@@ -583,8 +584,23 @@ def _safe_policy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         if key not in POLICY_SAFE_METADATA_KEYS:
             continue
         if isinstance(value, (str, int, float, bool)) or value is None:
-            safe[key] = value
+            if key == "session_id" and isinstance(value, str):
+                # Anonymise the upstream session_id before showing it to the
+                # policy. LongMemEval names gold-evidence sessions
+                # ``answer_<hash>`` while noise sessions use ``sharegpt``,
+                # ``ultrachat``, or random hex prefixes. Exposing that name
+                # would leak the gold-evidence label directly. Hash the id
+                # deterministically so within-session correlation still works
+                # but the prefix tell is gone.
+                safe[key] = _anonymise_session_id(value)
+            else:
+                safe[key] = value
     return safe
+
+
+def _anonymise_session_id(session_id: str) -> str:
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+    return f"session-{digest}"
 
 
 def build_memory_context(
