@@ -27,7 +27,7 @@ from fast_memory_write_env.embeddings import (
 from fast_memory_write_env.env import FastMemoryWriteEnv
 from fast_memory_write_env.hybrid_index import HybridRetrievalIndex
 from fast_memory_write_env.in_memory_index import InMemoryIndex
-from fast_memory_write_env.llm_client import LLMClient
+from fast_memory_write_env.llm_client import LLMClient, LLMClientError
 from fast_memory_write_env.metrics import (
     AggregateCounterSnapshot,
     AggregateMetrics,
@@ -540,15 +540,39 @@ class StreamingEvaluator:
                         search_results=self.env.last_search_results,
                     )
                     with state_lock:
-                        metric = evaluate_query_result(
-                            query=query,
-                            cited_memories=cited_memories,
-                            retrieved_memory_ids=retrieved_memory_ids,
-                            fact_lifecycles=fact_lifecycles,
-                            answer_text=str(answer_result.payload.get("answer", "")),
-                            answer_completed_at_ms=logical_time_ms,
-                            llm_client=self.judge_llm_client,
-                        )
+                        try:
+                            metric = evaluate_query_result(
+                                query=query,
+                                cited_memories=cited_memories,
+                                retrieved_memory_ids=retrieved_memory_ids,
+                                fact_lifecycles=fact_lifecycles,
+                                answer_text=str(answer_result.payload.get("answer", "")),
+                                answer_completed_at_ms=logical_time_ms,
+                                llm_client=self.judge_llm_client,
+                            )
+                        except LLMClientError as exc:
+                            # Single judge path failed; record the query as a
+                            # structured failure rather than crash the worker
+                            # or silently flip the verdict via substring match.
+                            metric = _judge_failure_query_metric(
+                                query=query,
+                                cited_memory_ids=cited_memory_ids,
+                                retrieved_memory_ids=retrieved_memory_ids,
+                                answer_text=str(answer_result.payload.get("answer", "")),
+                                error=str(exc),
+                            )
+                            records.append(
+                                RolloutRecord(
+                                    record_type="action",
+                                    episode_id=episode.episode_id,
+                                    timestamp_ms=float(query.timestamp_ms),
+                                    logical_time_ms=logical_time_ms,
+                                    payload={
+                                        "judge_error": str(exc),
+                                        "query_id": query.query_id,
+                                    },
+                                )
+                            )
                         query_metrics.append(metric)
                         records.append(
                             RolloutRecord(
@@ -887,6 +911,44 @@ def _update_index_availability(
 
 def _budget_value(value: int | None, *, fallback: int) -> int:
     return fallback if value is None else value
+
+
+def _judge_failure_query_metric(
+    *,
+    query: Any,
+    cited_memory_ids: list[str],
+    retrieved_memory_ids: list[str],
+    answer_text: str,
+    error: str,
+) -> QueryMetricRecord:
+    """Build a query metric that records a judge failure honestly.
+
+    The judge's single path raised after exhausted retries. We do not invent
+    an ``answer_correct`` verdict and we do not silently substring-match.
+    Both ``answer_correct`` and ``answer_success`` are False; ``answer_text``
+    is annotated with the judge error so downstream diagnostics can surface
+    the cause.
+    """
+
+    return QueryMetricRecord(
+        episode_id=query.episode_id,
+        query_id=query.query_id,
+        query_timestamp_ms=float(query.timestamp_ms),
+        answer_success=False,
+        answer_correct=False,
+        evidence_correct=False,
+        fact_evidence_coverage=False,
+        memory_precision=0.0,
+        memory_recall=0.0,
+        cited_memory_ids=list(cited_memory_ids),
+        retrieved_memory_ids=list(retrieved_memory_ids),
+        required_fact_ids=list(query.gold.required_fact_ids),
+        supporting_event_ids=list(query.gold.supporting_event_ids),
+        covered_fact_ids=[],
+        covered_event_ids=[],
+        debug_contains_answer_facts=False,
+        answer_text=f"[judge_failure] {error} :: {answer_text}",
+    )
 
 
 def _finalize_counters(

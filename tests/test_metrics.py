@@ -81,6 +81,7 @@ def test_query_scoring_separates_answer_text_from_evidence_coverage() -> None:
         fact_lifecycles=fact_lifecycles,
         answer_text=query.gold.answer_facts[0],
         answer_completed_at_ms=float(query.timestamp_ms + 6),
+        llm_client=MockLLMClient(),
     )
 
     assert metric.answer_correct is True
@@ -116,6 +117,7 @@ def test_query_scoring_uses_hidden_event_evidence_when_memory_fact_ids_are_empty
         fact_lifecycles=fact_lifecycles,
         answer_text=query.gold.answer_facts[0],
         answer_completed_at_ms=float(query.timestamp_ms + 6),
+        llm_client=MockLLMClient(),
     )
 
     assert metric.answer_success is True
@@ -139,6 +141,8 @@ def test_unrelated_answer_text_does_not_pass_answer_correctness() -> None:
         for fact_id in query.gold.required_fact_ids
     }
 
+    # The judge — not a substring matcher — must reject the unrelated answer.
+    judge = MockLLMClient(responses=["NO"])
     metric = evaluate_query_result(
         query=query,
         cited_memories=[memory],
@@ -146,6 +150,7 @@ def test_unrelated_answer_text_does_not_pass_answer_correctness() -> None:
         fact_lifecycles=fact_lifecycles,
         answer_text="A completely unrelated operational note.",
         answer_completed_at_ms=float(query.timestamp_ms + 6),
+        llm_client=judge,
     )
 
     assert metric.fact_evidence_coverage is True
@@ -153,6 +158,36 @@ def test_unrelated_answer_text_does_not_pass_answer_correctness() -> None:
     assert metric.answer_correct is False
     assert metric.answer_success is False
     assert metric.time_to_useful_memory is None
+
+
+def test_evaluate_query_result_raises_when_no_llm_client_for_non_abstention() -> None:
+    """No silent fallback to substring matching: missing the judge client must
+    raise so callers cannot mistake a degraded score for a real one."""
+
+    import pytest
+
+    from fast_memory_write_env.llm_client import LLMClientError
+
+    query, event = _query_and_gold_event()
+    memory = _memory_for_query(query)
+    fact_lifecycles = {
+        fact_id: FactLifecycle(
+            fact_id=fact_id,
+            source_event_id=event.event_id,
+            event_timestamp_ms=float(event.timestamp_ms),
+        )
+        for fact_id in query.gold.required_fact_ids
+    }
+
+    with pytest.raises(LLMClientError):
+        evaluate_query_result(
+            query=query,
+            cited_memories=[memory],
+            retrieved_memory_ids=[memory.memory_id],
+            fact_lifecycles=fact_lifecycles,
+            answer_text=query.gold.answer_facts[0],
+            answer_completed_at_ms=float(query.timestamp_ms + 6),
+        )
 
 
 def test_abstention_query_succeeds_only_with_abstention_and_no_citations() -> None:
@@ -213,6 +248,7 @@ def test_query_scoring_marks_missing_evidence_incorrect() -> None:
         fact_lifecycles=fact_lifecycles,
         answer_text=query.gold.answer_facts[0],
         answer_completed_at_ms=float(query.timestamp_ms + 6),
+        llm_client=MockLLMClient(),
     )
 
     assert metric.answer_correct is True

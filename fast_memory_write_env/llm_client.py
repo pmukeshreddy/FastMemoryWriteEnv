@@ -156,7 +156,9 @@ class MockLLMClient:
             return LLMResponse(content=json.dumps(response), parsed_json=response, model="mock")
 
         # No queued response: route by request shape so the same MockLLMClient
-        # serves both LLMMemoryWritePolicy and the env's answer-compose call.
+        # serves LLMMemoryWritePolicy, the env's answer-compose call, and the
+        # answer-correctness judge in tests. Each branch is a fixed
+        # deterministic response, not a fallback inside production code.
         request = _try_extract_request_json(messages)
         if request is not None and "new_event" in request:
             plan = _default_mock_plan_from_request(request)
@@ -164,6 +166,9 @@ class MockLLMClient:
         if request is not None and "candidate_memories" in request:
             compose = _default_mock_compose_from_request(request)
             return LLMResponse(content=json.dumps(compose), parsed_json=compose, model="mock")
+        if _is_judge_request(messages):
+            # Tests that need the judge to disagree must queue "NO" explicitly.
+            return LLMResponse(content="YES", parsed_json=None, model="mock")
         raise LLMClientError("MockLLMClient could not classify request shape")
 
 
@@ -245,6 +250,15 @@ def _try_extract_request_json(messages: list[LLMMessage]) -> dict[str, Any] | No
         if isinstance(payload, dict):
             return payload
     return None
+
+
+def _is_judge_request(messages: list[LLMMessage]) -> bool:
+    """Recognise the answer-correctness judge by its system prompt."""
+
+    for message in messages:
+        if message.role == "system" and "strict grader" in message.content.lower():
+            return True
+    return False
 
 
 def _default_mock_compose_from_request(request: dict[str, Any]) -> dict[str, Any]:

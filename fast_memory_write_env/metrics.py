@@ -32,24 +32,31 @@ _JUDGE_SYSTEM_PROMPT = (
 )
 
 
+_JUDGE_MAX_RETRIES = 2
+
+
 def _judge_answer_with_llm(
     *,
     question: str,
     answer: str,
     answer_facts: list[str],
     llm_client: LLMClient,
-) -> bool | None:
+) -> bool:
     """Use an LLM judge to decide whether ``answer`` is correct for ``question``.
 
-    Returns ``True``/``False`` from a deterministic YES/NO verdict, or ``None``
-    when the client errors, refuses, or returns a response that is not a
-    clear YES/NO. Callers must treat ``None`` as "unable to judge" and fall
-    back to the string-match verifier so a transient LLM failure never
-    silently flips a metric.
+    Single production path: the LLM either produces a deterministic YES/NO
+    verdict or this raises ``LLMClientError`` after exhausting repair retries.
+    There is no silent fallback to substring matching anywhere; if the
+    grader cannot give a verdict, the caller hears about it.
     """
 
     if not answer_facts:
-        return None
+        # No gold facts means the gold definition is incomplete; this should
+        # never happen for non-abstention queries (the schema enforces it),
+        # but we surface it loudly rather than silently calling NO.
+        raise LLMClientError(
+            "judge cannot evaluate answer_correct without gold answer_facts"
+        )
 
     gold_block = "\n".join(f"- {fact}" for fact in answer_facts)
     user_prompt = (
@@ -59,50 +66,47 @@ def _judge_answer_with_llm(
         f"{gold_block}\n\n"
         "Reply with exactly YES or NO."
     )
-    messages = [
+    messages: list[LLMMessage] = [
         LLMMessage(role="system", content=_JUDGE_SYSTEM_PROMPT),
         LLMMessage(role="user", content=user_prompt),
     ]
-    try:
+    last_content = ""
+    last_error: str = ""
+
+    for attempt in range(_JUDGE_MAX_RETRIES + 1):
         response = llm_client.complete(
             messages,
             temperature=0.0,
             response_format={"type": "text"},
         )
-    except LLMClientError:
-        return None
-    except Exception:  # pragma: no cover - defensive: unexpected client failures
-        return None
-
-    verdict = (response.content or "").strip().upper()
-    if not verdict:
-        return None
-    if verdict.startswith("YES"):
-        return True
-    if verdict.startswith("NO"):
-        return False
-    return None
-
-
-def _evaluate_answer_correctness(
-    *,
-    question: str,
-    answer_text: str,
-    answer_facts: list[str],
-    llm_client: LLMClient | None,
-) -> bool:
-    """Judge with the LLM when available; fall back to the string-match verifier."""
-
-    if llm_client is not None:
-        verdict = _judge_answer_with_llm(
-            question=question,
-            answer=answer_text,
-            answer_facts=answer_facts,
-            llm_client=llm_client,
+        last_content = response.content or ""
+        verdict = last_content.strip().upper()
+        if verdict.startswith("YES"):
+            return True
+        if verdict.startswith("NO"):
+            return False
+        last_error = (
+            f"expected YES or NO, got: {last_content!r}"
+            if last_content
+            else "judge returned empty content"
         )
-        if verdict is not None:
-            return verdict
-    return answer_satisfies_gold_facts(answer_text, answer_facts)
+        if attempt >= _JUDGE_MAX_RETRIES:
+            break
+        messages = [
+            *messages,
+            LLMMessage(role="assistant", content=last_content or "<empty response>"),
+            LLMMessage(
+                role="user",
+                content=(
+                    "Repair the previous response. Reply with exactly one token: "
+                    f"YES or NO. Nothing else. Validation error: {last_error}"
+                ),
+            ),
+        ]
+
+    raise LLMClientError(
+        f"judge did not produce YES/NO after {_JUDGE_MAX_RETRIES + 1} attempts: {last_error}"
+    )
 
 
 class RunConfig(StrictBaseModel):
@@ -266,14 +270,14 @@ def evaluate_query_result(
     answer_completed_at_ms: float,
     llm_client: LLMClient | None = None,
 ) -> QueryMetricRecord:
-    """Score one query using fact/evidence coverage instead of exact matching.
+    """Score one query using fact/evidence coverage and an LLM judge.
 
-    When ``llm_client`` is provided, ``answer_correct`` is decided by an
-    LLM-as-judge call (see :func:`_judge_answer_with_llm`) for non-abstention
-    queries. Any judge failure transparently falls back to the legacy
-    string-match verifier so a flaky LLM never silently degrades scoring.
-    Evidence, fact-coverage, precision, recall, and time-to-useful-memory are
-    untouched.
+    Non-abstention queries require ``llm_client`` for ``answer_correct``;
+    the judge has a single path (see :func:`_judge_answer_with_llm`) and
+    raises ``LLMClientError`` rather than fall back to substring matching.
+    Abstention queries are scored deterministically against the abstention
+    pattern and do not consult the judge. Evidence, fact-coverage,
+    precision, recall, and time-to-useful-memory are untouched.
     """
 
     required_fact_ids = set(query.gold.required_fact_ids)
@@ -325,9 +329,15 @@ def evaluate_query_result(
 
     fact_evidence_coverage = required_fact_ids.issubset(cited_fact_ids)
     evidence_correct = fact_evidence_coverage and supporting_event_ids.issubset(cited_event_ids)
-    answer_correct = _evaluate_answer_correctness(
+    if llm_client is None:
+        raise LLMClientError(
+            "answer_correct evaluation requires an llm_client; configure "
+            "StreamingEvaluator.judge_llm_client or pass llm_client to "
+            "evaluate_query_result"
+        )
+    answer_correct = _judge_answer_with_llm(
         question=query.text,
-        answer_text=answer_text,
+        answer=answer_text,
         answer_facts=query.gold.answer_facts,
         llm_client=llm_client,
     )
@@ -582,28 +592,6 @@ def _contains_all_answer_facts(answer_text: str, answer_facts: list[str]) -> boo
     return all(_normalize_debug_text(fact) in normalized_answer for fact in answer_facts)
 
 
-def answer_satisfies_gold_facts(answer_text: str, answer_facts: list[str]) -> bool:
-    """Conservative deterministic answer verifier for gold fact strings."""
-
-    if not answer_facts:
-        return False
-    normalized_answer = _normalize_debug_text(answer_text)
-    answer_tokens = set(_semantic_tokens(answer_text))
-    if not answer_tokens:
-        return False
-    for fact in answer_facts:
-        normalized_fact = _normalize_debug_text(fact)
-        if normalized_fact and normalized_fact in normalized_answer:
-            continue
-        fact_tokens = set(_semantic_tokens(fact))
-        if not fact_tokens:
-            return False
-        coverage = len(fact_tokens & answer_tokens) / len(fact_tokens)
-        if coverage < 0.65:
-            return False
-    return True
-
-
 def answer_is_abstention(answer_text: str) -> bool:
     """Return whether an answer clearly abstains from unsupported memory."""
 
@@ -634,59 +622,6 @@ def _event_fact_ids_from_lifecycles(
 
 def _normalize_debug_text(value: str) -> str:
     return " ".join(value.lower().split())
-
-
-def _semantic_tokens(value: str) -> list[str]:
-    stop_words = {
-        "a",
-        "an",
-        "and",
-        "are",
-        "at",
-        "be",
-        "by",
-        "for",
-        "from",
-        "has",
-        "have",
-        "is",
-        "it",
-        "now",
-        "of",
-        "on",
-        "or",
-        "right",
-        "should",
-        "the",
-        "to",
-        "was",
-        "were",
-        "with",
-    }
-    cleaned = []
-    for raw_token in value.lower().replace(":", " ").replace(";", " ").replace(".", " ").split():
-        token = "".join(char for char in raw_token if char.isalnum() or char == "-")
-        token = _normalize_token(token)
-        if token and token not in stop_words:
-            cleaned.append(token)
-    return cleaned
-
-
-def _normalize_token(token: str) -> str:
-    replacements = {
-        "contacted": "contact",
-        "notices": "notice",
-        "prefers": "prefer",
-        "reported": "report",
-        "routed": "route",
-        "routing": "route",
-        "alerts": "alert",
-    }
-    if token in replacements:
-        return replacements[token]
-    if token.endswith("s") and len(token) > 4:
-        return token[:-1]
-    return token
 
 
 def _csv_value(value: Any) -> Any:

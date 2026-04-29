@@ -77,6 +77,7 @@ class _AdaUpdateAndStalePolicy:
 
     def __init__(self) -> None:
         self.first_call = True
+        self.llm_client = MockLLMClient()
 
     def decide(
         self,
@@ -116,6 +117,9 @@ class _AdaUpdateAndStalePolicy:
 class _BenDelayedIndexPolicy:
     """Two delayed-index memories. Indexing budget is one operation."""
 
+    def __init__(self) -> None:
+        self.llm_client = MockLLMClient()
+
     def decide(
         self,
         *,
@@ -145,6 +149,7 @@ class _DeeCompressionPolicy:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.llm_client = MockLLMClient()
 
     def decide(
         self,
