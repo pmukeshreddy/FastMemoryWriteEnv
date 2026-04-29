@@ -7,6 +7,9 @@ from pathlib import Path
 
 from pydantic import Field
 
+from fast_memory_write_env.embeddings import (
+    DEFAULT_OPENAI_EMBEDDING_DIMENSION,
+)
 from fast_memory_write_env.schemas import StrictBaseModel
 
 
@@ -29,7 +32,7 @@ class PineconeConfig(StrictBaseModel):
     index_name: str = Field(min_length=1)
     cloud: str = Field(min_length=1)
     region: str = Field(min_length=1)
-    dimension: int = Field(default=64, ge=1)
+    dimension: int = Field(default=DEFAULT_OPENAI_EMBEDDING_DIMENSION, ge=1)
     metric: str = "cosine"
     namespace: str = "fast-memory-write-env"
     create_if_missing: bool = False
@@ -38,11 +41,17 @@ class PineconeConfig(StrictBaseModel):
     def from_env(
         cls,
         *,
-        dimension: int = 64,
+        dimension: int | None = None,
         namespace: str = "fast-memory-write-env",
         create_if_missing: bool = False,
     ) -> PineconeConfig:
-        """Load required Pinecone configuration from environment variables."""
+        """Load required Pinecone configuration from environment variables.
+
+        ``dimension`` defaults to ``OPENAI_EMBEDDING_DIMENSION`` (or the
+        ``text-embedding-3-small`` default of ``1536``) so real runs match
+        the embedding client. Tests that want a smaller dimension may pass
+        an explicit value.
+        """
 
         missing = [name for name in PINECONE_ENV_VARS if not os.getenv(name)]
         if missing:
@@ -53,7 +62,7 @@ class PineconeConfig(StrictBaseModel):
             index_name=os.environ["PINECONE_INDEX_NAME"],
             cloud=os.environ["PINECONE_CLOUD"],
             region=os.environ["PINECONE_REGION"],
-            dimension=dimension,
+            dimension=_resolve_dimension(dimension),
             namespace=namespace,
             create_if_missing=create_if_missing,
         )
@@ -75,7 +84,7 @@ def pinecone_env_present() -> bool:
 def load_pinecone_config(
     *,
     required: bool = False,
-    dimension: int = 64,
+    dimension: int | None = None,
     namespace: str = "fast-memory-write-env",
     create_if_missing: bool = False,
 ) -> PineconeConfig | None:
@@ -94,3 +103,17 @@ def load_pinecone_config(
         namespace=namespace,
         create_if_missing=create_if_missing,
     )
+
+
+def _resolve_dimension(dimension: int | None) -> int:
+    if dimension is not None:
+        return dimension
+    env_value = os.getenv("OPENAI_EMBEDDING_DIMENSION")
+    if env_value is None:
+        return DEFAULT_OPENAI_EMBEDDING_DIMENSION
+    try:
+        return int(env_value)
+    except ValueError as exc:
+        raise MissingPineconeConfigError(
+            "OPENAI_EMBEDDING_DIMENSION must be an integer"
+        ) from exc

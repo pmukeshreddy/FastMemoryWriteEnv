@@ -198,7 +198,6 @@ def _default_mock_plan(messages: list[LLMMessage]) -> dict[str, Any]:
         "actions": [
                 {
                     "action_type": "write_memory",
-                    "memory_id": f"mem-{event_id}",
                     "entity_id": entity_id,
                     "content": content,
                     "source_event_ids": [event_id],

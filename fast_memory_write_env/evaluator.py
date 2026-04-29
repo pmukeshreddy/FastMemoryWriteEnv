@@ -13,13 +13,20 @@ from pydantic import Field
 
 from fast_memory_write_env.actions import (
     AnswerAction,
-    IndexNowAction,
+    PolicyPlanError,
     SearchMemoryAction,
     StoreRawAction,
+    compile_policy_actions,
 )
 from fast_memory_write_env.config import load_pinecone_config
+from fast_memory_write_env.embeddings import (
+    EmbeddingClient,
+    EmbeddingClientError,
+    OpenAIEmbeddingClient,
+)
 from fast_memory_write_env.env import FastMemoryWriteEnv
 from fast_memory_write_env.in_memory_index import InMemoryIndex
+from fast_memory_write_env.llm_client import LLMClient
 from fast_memory_write_env.metrics import (
     AggregateCounterSnapshot,
     AggregateMetrics,
@@ -155,20 +162,43 @@ class _AsyncMemoryWriteWorker:
             recent_events = list(self.recent_events[-5:])
 
         budget_snapshot = self.env.budget_snapshot()
-        actions = self.policy.decide(
-            new_event=queue_item.event,
-            active_memories=self.env.memory_store.list_active(),
-            recent_events=recent_events,
-            latency_budget_ms=self.latency_budget_ms,
-            storage_budget_tokens_remaining=_budget_value(
-                budget_snapshot["storage_budget_tokens_remaining"],
-                fallback=self.storage_budget_tokens_remaining,
-            ),
-            indexing_budget_operations_remaining=_budget_value(
-                budget_snapshot["indexing_budget_operations_remaining"],
-                fallback=self.indexing_budget_operations_remaining,
-            ),
-        )
+        active_memories = self.env.memory_store.list_active()
+        active_memory_ids = [memory.memory_id for memory in active_memories]
+        try:
+            proposals = self.policy.decide(
+                new_event=queue_item.event,
+                active_memories=active_memories,
+                recent_events=recent_events,
+                latency_budget_ms=self.latency_budget_ms,
+                storage_budget_tokens_remaining=_budget_value(
+                    budget_snapshot["storage_budget_tokens_remaining"],
+                    fallback=self.storage_budget_tokens_remaining,
+                ),
+                indexing_budget_operations_remaining=_budget_value(
+                    budget_snapshot["indexing_budget_operations_remaining"],
+                    fallback=self.indexing_budget_operations_remaining,
+                ),
+            )
+            actions = compile_policy_actions(
+                proposals,
+                active_memory_ids=active_memory_ids,
+            )
+        except PolicyPlanError as exc:
+            with self.state_lock:
+                self.records.append(
+                    RolloutRecord(
+                        record_type="action",
+                        episode_id=self.episode_id,
+                        timestamp_ms=float(queue_item.event.timestamp_ms),
+                        logical_time_ms=self.logical_time_ms,
+                        payload={
+                            "policy_plan_error": str(exc),
+                            "event_id": queue_item.event.event_id,
+                            "active_memory_ids": active_memory_ids,
+                        },
+                    )
+                )
+            actions = []
         for action in actions:
             result = self.env.execute_action_at(action, current_time_ms=int(self.logical_time_ms))
             self.logical_time_ms += result.latency_ms
@@ -237,6 +267,7 @@ class StreamingEvaluator:
         storage_budget_tokens_remaining: int = 10_000,
         indexing_budget_operations_remaining: int = 3,
         run_config: RunConfig | dict[str, Any] | None = None,
+        judge_llm_client: LLMClient | None = None,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -244,6 +275,15 @@ class StreamingEvaluator:
         self.storage_budget_tokens_remaining = storage_budget_tokens_remaining
         self.indexing_budget_operations_remaining = indexing_budget_operations_remaining
         self.run_config = RunConfig.model_validate(run_config or {})
+        # Default the answer-correctness judge to the policy's LLM client when
+        # one is available (LLMMemoryWritePolicy exposes ``llm_client``).
+        # Baselines and rule-based test policies have no client, so scoring
+        # falls back to the legacy string-match verifier.
+        self.judge_llm_client: LLMClient | None = (
+            judge_llm_client
+            if judge_llm_client is not None
+            else getattr(policy, "llm_client", None)
+        )
 
     @classmethod
     def with_local_test_index(
@@ -269,13 +309,25 @@ class StreamingEvaluator:
         policy: MemoryWritePolicy,
         work_dir: str | Path,
         run_config: RunConfig | dict[str, Any] | None = None,
+        embedding_client: EmbeddingClient | None = None,
     ) -> StreamingEvaluator:
-        config = load_pinecone_config(required=True)
+        try:
+            embedding_client = embedding_client or OpenAIEmbeddingClient.from_env()
+        except EmbeddingClientError as exc:
+            raise RuntimeError(
+                "Pinecone runs require an embedding client; "
+                "set OPENAI_API_KEY (and optionally OPENAI_EMBEDDING_MODEL/"
+                "OPENAI_EMBEDDING_DIMENSION), or pass embedding_client explicitly."
+            ) from exc
+        config = load_pinecone_config(
+            required=True,
+            dimension=embedding_client.dimension,
+        )
         assert config is not None
         env = FastMemoryWriteEnv(
             raw_event_store=RawEventStore(Path(work_dir) / "raw.sqlite"),
             memory_store=MemoryStore(Path(work_dir) / "memory.sqlite"),
-            retrieval_index=PineconeIndex(config),
+            retrieval_index=PineconeIndex(config, embedding_client=embedding_client),
         )
         run_config_payload = _merge_run_config(
             run_config,
@@ -466,6 +518,7 @@ class StreamingEvaluator:
                             fact_lifecycles=fact_lifecycles,
                             answer_text=str(answer_result.payload.get("answer", "")),
                             answer_completed_at_ms=logical_time_ms,
+                            llm_client=self.judge_llm_client,
                         )
                         query_metrics.append(metric)
                         records.append(
@@ -524,6 +577,7 @@ def write_evaluation_outputs(result: EvaluationResult, output_dir: str | Path) -
     write_rollout_jsonl(result.rollout_records, raw_path)
     write_metrics_csv(result.query_metrics, result.aggregate_metrics, metrics_path)
     write_predictions_jsonl(result.rollout_records, predictions_path)
+    diagnostics = build_failure_diagnostics(result.query_metrics, result.rollout_records)
     summary = {
         "episode_id": result.episode_id,
         "metrics": headline_metrics(result.aggregate_metrics),
@@ -533,6 +587,7 @@ def write_evaluation_outputs(result: EvaluationResult, output_dir: str | Path) -
             "rollout_records": len(result.rollout_records),
             "query_metrics": len(result.query_metrics),
         },
+        "diagnostics": diagnostics,
         "output_paths": {
             "raw_rollouts": str(raw_path),
             "metrics_csv": str(metrics_path),
@@ -551,6 +606,102 @@ def write_evaluation_outputs(result: EvaluationResult, output_dir: str | Path) -
             }
         }
     )
+
+
+def build_failure_diagnostics(
+    query_metrics: list[QueryMetricRecord],
+    rollout_records: list[RolloutRecord],
+) -> dict[str, Any]:
+    """Build per-query failure-stage diagnostics for ``eval_summary.json``.
+
+    For each query that did not return ``answer_success``, report the earliest
+    pipeline stage that failed (raw-write, memory-write, indexing, retrieval,
+    citation, answer). Also surface counts of action-execution failures and
+    plan-validation failures observed during the rollout.
+    """
+
+    failure_stage_counts: dict[str, int] = {
+        "raw_written": 0,
+        "memory_written": 0,
+        "indexed": 0,
+        "retrieved": 0,
+        "cited": 0,
+        "answered": 0,
+    }
+    query_failures: list[dict[str, Any]] = []
+    for metric in query_metrics:
+        if metric.answer_success:
+            continue
+        stage_status = {
+            "raw_written": metric.time_to_raw_write is not None,
+            "memory_written": metric.time_to_memory_write is not None,
+            "indexed": metric.time_to_indexed_memory is not None,
+            "retrieved": bool(metric.retrieved_memory_ids),
+            "cited": bool(metric.cited_memory_ids),
+            "answered": metric.answer_correct,
+        }
+        first_missing_stage: str | None = None
+        for stage in ("raw_written", "memory_written", "indexed", "retrieved", "cited", "answered"):
+            if not stage_status[stage]:
+                first_missing_stage = stage
+                break
+        if first_missing_stage is not None:
+            failure_stage_counts[first_missing_stage] += 1
+        query_failures.append(
+            {
+                "query_id": metric.query_id,
+                "query_timestamp_ms": metric.query_timestamp_ms,
+                "stage_status": stage_status,
+                "first_missing_stage": first_missing_stage,
+                "retrieved_memory_ids": list(metric.retrieved_memory_ids),
+                "cited_memory_ids": list(metric.cited_memory_ids),
+                "required_fact_ids": list(metric.required_fact_ids),
+                "covered_fact_ids": list(metric.covered_fact_ids),
+                "answer_text": metric.answer_text,
+            }
+        )
+
+    action_failures: list[dict[str, Any]] = []
+    plan_errors: list[dict[str, Any]] = []
+    delayed_unindexed_at_end = 0
+    for record in rollout_records:
+        if record.record_type != "action":
+            continue
+        if "policy_plan_error" in record.payload:
+            plan_errors.append(
+                {
+                    "event_id": record.payload.get("event_id"),
+                    "logical_time_ms": record.logical_time_ms,
+                    "error": record.payload.get("policy_plan_error"),
+                    "active_memory_ids": record.payload.get("active_memory_ids", []),
+                }
+            )
+            continue
+        result_payload = record.payload.get("result")
+        if not isinstance(result_payload, dict):
+            continue
+        if result_payload.get("success") is False:
+            action_failures.append(
+                {
+                    "action_type": result_payload.get("action_type"),
+                    "error": result_payload.get("error"),
+                    "logical_time_ms": record.logical_time_ms,
+                    "proposed_action": record.payload.get("proposed_action"),
+                }
+            )
+        if result_payload.get("action_type") == "delay_index" and result_payload.get("success"):
+            delayed_unindexed_at_end += 1
+
+    return {
+        "query_failure_count": len(query_failures),
+        "failure_stage_counts": failure_stage_counts,
+        "query_failures": query_failures,
+        "action_failure_count": len(action_failures),
+        "action_failures": action_failures,
+        "policy_plan_error_count": len(plan_errors),
+        "policy_plan_errors": plan_errors,
+        "delay_index_invocations": delayed_unindexed_at_end,
+    }
 
 
 def write_predictions_jsonl(records: list[RolloutRecord], path: str | Path) -> None:
@@ -656,12 +807,14 @@ def _update_timelines_for_action(
                 if fact_id in fact_lifecycles:
                     fact_lifecycles[fact_id].indexed_at_ms = logical_time_ms
     if action_type == "compress_memory":
-        target_id = str(action_payload.get("target_memory_id", ""))
+        target_id = str(result_payload.get("target_memory_id", "") or action_payload.get("target_memory_id", ""))
         memory = env.memory_store.get(target_id)
         if memory is not None:
             for fact_id in _fact_ids_for_event_ids(memory.source_event_ids, fact_lifecycles):
                 if fact_id in fact_lifecycles:
                     fact_lifecycles[fact_id].memory_written_at_ms = logical_time_ms
+                    if result_payload.get("indexed"):
+                        fact_lifecycles[fact_id].indexed_at_ms = logical_time_ms
 
 
 def _update_latency_counters(
@@ -687,6 +840,12 @@ def _update_index_availability(
 ) -> None:
     if action_type in {"write_memory", "update_memory", "index_now"} and result_payload.get("indexed"):
         memory_id = result_payload.get("memory_id")
+        if isinstance(memory_id, str):
+            indexed_memory_available_at_ms[memory_id] = float(
+                result_payload.get("available_at_ms") or logical_time_ms
+            )
+    if action_type == "compress_memory" and result_payload.get("indexed"):
+        memory_id = result_payload.get("target_memory_id")
         if isinstance(memory_id, str):
             indexed_memory_available_at_ms[memory_id] = float(
                 result_payload.get("available_at_ms") or logical_time_ms

@@ -7,8 +7,12 @@ from typing import Any, Protocol
 
 from pydantic import ValidationError
 
-from fast_memory_write_env.actions import MemoryAction, validate_memory_actions
-from fast_memory_write_env.env import deterministic_memory_id
+from fast_memory_write_env.actions import (
+    PolicyAction,
+    PolicyPlanError,
+    validate_action_plan,
+    validate_policy_actions,
+)
 from fast_memory_write_env.index import estimate_tokens
 from fast_memory_write_env.llm_client import LLMClient, LLMClientError, LLMMessage
 from fast_memory_write_env.schemas import (
@@ -34,7 +38,7 @@ POLICY_SAFE_METADATA_KEYS = {
 
 
 def memory_action_response_format() -> dict[str, Any]:
-    """OpenAI Structured Outputs schema for validated memory actions."""
+    """OpenAI Structured Outputs schema for validated policy proposals."""
 
     id_string = {"type": "string", "pattern": ID_PATTERN}
     source_event_ids = {"type": "array", "items": id_string, "minItems": 1}
@@ -56,10 +60,6 @@ def memory_action_response_format() -> dict[str, Any]:
                                 _strict_action_schema(
                                     {
                                         "action_type": {"type": "string", "enum": ["write_memory"]},
-                                        "memory_id": {
-                                            **id_string,
-                                            "description": "Stable memory ID. Use a mem- prefix.",
-                                        },
                                         "entity_id": id_string,
                                         "content": {"type": "string"},
                                         "source_event_ids": source_event_ids,
@@ -70,7 +70,10 @@ def memory_action_response_format() -> dict[str, Any]:
                                 _strict_action_schema(
                                     {
                                         "action_type": {"type": "string", "enum": ["update_memory"]},
-                                        "memory_id": id_string,
+                                        "memory_id": {
+                                            **id_string,
+                                            "description": "Must reference an existing memory_id from active_memories.",
+                                        },
                                         "content": {"type": "string"},
                                         "source_event_ids": source_event_ids,
                                         "reason": {"type": "string"},
@@ -80,7 +83,10 @@ def memory_action_response_format() -> dict[str, Any]:
                                 _strict_action_schema(
                                     {
                                         "action_type": {"type": "string", "enum": ["mark_stale"]},
-                                        "memory_id": id_string,
+                                        "memory_id": {
+                                            **id_string,
+                                            "description": "Must reference an existing active memory_id.",
+                                        },
                                         "reason": {"type": "string"},
                                     }
                                 ),
@@ -95,20 +101,26 @@ def memory_action_response_format() -> dict[str, Any]:
                                     {
                                         "action_type": {"type": "string", "enum": ["compress_memory"]},
                                         "source_memory_ids": source_memory_ids,
-                                        "target_memory_id": id_string,
                                         "compressed_content": {"type": "string"},
+                                        "index_immediately": {"type": "boolean"},
                                     }
                                 ),
                                 _strict_action_schema(
                                     {
                                         "action_type": {"type": "string", "enum": ["index_now"]},
-                                        "memory_id": id_string,
+                                        "memory_id": {
+                                            **id_string,
+                                            "description": "Must reference an existing active memory_id.",
+                                        },
                                     }
                                 ),
                                 _strict_action_schema(
                                     {
                                         "action_type": {"type": "string", "enum": ["delay_index"]},
-                                        "memory_id": id_string,
+                                        "memory_id": {
+                                            **id_string,
+                                            "description": "Must reference an existing active memory_id.",
+                                        },
                                         "retry_after_ms": {"type": "integer", "minimum": 0},
                                         "reason": {"type": "string"},
                                     }
@@ -144,15 +156,17 @@ class MemoryWritePolicy(Protocol):
         latency_budget_ms: int,
         storage_budget_tokens_remaining: int,
         indexing_budget_operations_remaining: int,
-    ) -> list[MemoryAction]:
-        """Return proposed actions. The environment executes them."""
+    ) -> list[PolicyAction]:
+        """Return validated policy proposals. The environment executes them."""
 
 
 class LLMMemoryWritePolicy:
     """Main LLM memory-write policy.
 
-    This class proposes validated actions only. It does not mutate stores and
-    does not call retrieval backends.
+    The policy proposes validated actions only. It does not mutate stores and
+    does not call retrieval backends. Memory IDs for new memories are assigned
+    by the environment; the LLM may only reference existing memory IDs from
+    ``active_memories``.
     """
 
     def __init__(
@@ -175,12 +189,13 @@ class LLMMemoryWritePolicy:
         latency_budget_ms: int,
         storage_budget_tokens_remaining: int,
         indexing_budget_operations_remaining: int,
-    ) -> list[MemoryAction]:
+    ) -> list[PolicyAction]:
         budget = MemoryWriteBudget(
             latency_budget_ms=latency_budget_ms,
             storage_budget_tokens_remaining=storage_budget_tokens_remaining,
             indexing_budget_operations_remaining=indexing_budget_operations_remaining,
         )
+        active_memory_ids = [memory.memory_id for memory in active_memories]
         messages = self._build_messages(new_event, active_memories, recent_events, budget)
         last_error: Exception | None = None
         last_content = ""
@@ -194,8 +209,10 @@ class LLMMemoryWritePolicy:
             last_content = response.content
             try:
                 payload = response.parsed_json if response.parsed_json is not None else _parse_json_payload(last_content)
-                return _strip_llm_hidden_fact_ids(_validate_action_payload(payload))
-            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+                proposals = _validate_action_payload(payload)
+                validate_action_plan(proposals, active_memory_ids=active_memory_ids)
+                return proposals
+            except (json.JSONDecodeError, ValidationError, PolicyPlanError, ValueError) as exc:
                 last_error = exc
                 if attempt >= self.max_retries:
                     break
@@ -208,6 +225,10 @@ class LLMMemoryWritePolicy:
                             "Repair the previous response. Return JSON only with this shape: "
                             '{"actions": [validated memory action objects]}. '
                             "The active response_format JSON schema is strict; satisfy it exactly. "
+                            "Do not include memory_id on write_memory or target_memory_id on compress_memory; "
+                            "the environment generates them. update_memory, mark_stale, index_now, "
+                            "delay_index, and compress_memory may only reference memory_ids that already "
+                            f"appear in active_memories: {active_memory_ids}. "
                             f"Validation error: {exc}"
                         ),
                     ),
@@ -227,7 +248,10 @@ class LLMMemoryWritePolicy:
             "Decide what memory actions to propose for the new raw event under the budgets. "
             "Return JSON only. Do not call tools, stores, or indexes. "
             "Allowed action_type values: write_memory, update_memory, mark_stale, "
-            "ignore_event, compress_memory, index_now, delay_index."
+            "ignore_event, compress_memory, index_now, delay_index. "
+            "The environment owns memory IDs: never include memory_id on write_memory or "
+            "target_memory_id on compress_memory. Existing-memory actions may only reference "
+            "memory_ids that appear in active_memories."
         )
         user_payload = {
             "new_event": policy_visible_event(new_event),
@@ -239,7 +263,6 @@ class LLMMemoryWritePolicy:
                 "required_fields_by_action_type": {
                     "write_memory": [
                         "action_type",
-                        "memory_id",
                         "entity_id",
                         "content",
                         "source_event_ids",
@@ -256,21 +279,20 @@ class LLMMemoryWritePolicy:
                     "compress_memory": [
                         "action_type",
                         "source_memory_ids",
-                        "target_memory_id",
                         "compressed_content",
                     ],
                     "index_now": ["action_type", "memory_id"],
                     "delay_index": ["action_type", "memory_id", "retry_after_ms", "reason"],
                 },
                 "notes": [
-                    "Use write_memory for durable new facts.",
-                    "For write_memory, memory_id is required. Use a stable ID beginning with mem-.",
-                    "Use update_memory for corrections to existing active memories.",
-                    "Use mark_stale when old facts are superseded.",
+                    "Use write_memory for durable new facts; the environment assigns the memory_id.",
+                    "Prefer update_memory over (update_memory + mark_stale) when correcting an existing memory; do not emit both for the same memory_id.",
+                    "Use mark_stale only when an old memory is fully superseded by a different existing memory.",
                     "Use ignore_event for noise or low-value duplicates.",
-                    "Use index_now or action index_immediately only when indexing budget allows.",
-                    "Use delay_index when memory should exist but not be indexed yet.",
-                    "Do not include fact_ids; evaluator-only fact labels are hidden and will be ignored.",
+                    "Use index_now only when indexing budget allows; otherwise set index_immediately on write_memory or use delay_index.",
+                    "Use delay_index when memory should exist but indexing must wait for budget; the memory remains queryable later via index_now.",
+                    "Under tight budgets, prioritize urgent or current facts over older low-priority ones; consider compress_memory to merge several delayed useful memories into one indexable summary.",
+                    "Memory IDs for write_memory and target IDs for compress_memory are environment-owned. Do not invent them.",
                 ],
             },
         }
@@ -292,8 +314,8 @@ class NoMemoryBaseline:
         latency_budget_ms: int,
         storage_budget_tokens_remaining: int,
         indexing_budget_operations_remaining: int,
-    ) -> list[MemoryAction]:
-        return validate_memory_actions(
+    ) -> list[PolicyAction]:
+        return validate_policy_actions(
             [
                 {
                     "action_type": "ignore_event",
@@ -316,16 +338,14 @@ class StoreEverythingBaseline:
         latency_budget_ms: int,
         storage_budget_tokens_remaining: int,
         indexing_budget_operations_remaining: int,
-    ) -> list[MemoryAction]:
-        return validate_memory_actions(
+    ) -> list[PolicyAction]:
+        return validate_policy_actions(
             [
                 {
                     "action_type": "write_memory",
-                    "memory_id": deterministic_memory_id([new_event.event_id], new_event.content),
                     "entity_id": new_event.entity_id,
                     "content": new_event.content,
                     "source_event_ids": [new_event.event_id],
-                    "fact_ids": [fact.fact_id for fact in new_event.facts],
                     "importance": 3,
                     "index_immediately": indexing_budget_operations_remaining > 0,
                     "metadata": {"baseline": "store_everything"},
@@ -346,7 +366,7 @@ class OraclePolicy:
         latency_budget_ms: int,
         storage_budget_tokens_remaining: int,
         indexing_budget_operations_remaining: int,
-    ) -> list[MemoryAction]:
+    ) -> list[PolicyAction]:
         if new_event.category in {EventCategory.NOISE, EventCategory.DUPLICATE}:
             return NoMemoryBaseline().decide(
                 new_event=new_event,
@@ -365,14 +385,13 @@ class OraclePolicy:
             EventCategory.CONTRADICTION,
             EventCategory.STALE_UPDATE,
         }:
-            return validate_memory_actions(
+            return validate_policy_actions(
                 [
                     {
                         "action_type": "update_memory",
                         "memory_id": matching_memory.memory_id,
                         "content": new_event.content,
                         "source_event_ids": [new_event.event_id],
-                        "fact_ids": [fact.fact_id for fact in new_event.facts],
                         "reason": "OraclePolicy applies labeled correction/update.",
                         "index_immediately": indexing_budget_operations_remaining > 0,
                         "metadata": {"baseline": "oracle"},
@@ -380,15 +399,13 @@ class OraclePolicy:
                 ]
             )
 
-        return validate_memory_actions(
+        return validate_policy_actions(
             [
                 {
                     "action_type": "write_memory",
-                    "memory_id": deterministic_memory_id([new_event.event_id], new_event.content),
                     "entity_id": new_event.entity_id,
                     "content": new_event.content,
                     "source_event_ids": [new_event.event_id],
-                    "fact_ids": [fact.fact_id for fact in new_event.facts],
                     "importance": 5 if new_event.category == EventCategory.URGENT_FACT else 3,
                     "index_immediately": indexing_budget_operations_remaining > 0,
                     "metadata": {"baseline": "oracle"},
@@ -413,12 +430,12 @@ def _strip_fenced_json(content: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _validate_action_payload(payload: Any) -> list[MemoryAction]:
+def _validate_action_payload(payload: Any) -> list[PolicyAction]:
     if isinstance(payload, dict) and "actions" in payload:
         actions = payload["actions"]
     else:
         actions = payload
-    return validate_memory_actions(actions)
+    return validate_policy_actions(actions)
 
 
 def policy_visible_event(event: RawEvent) -> dict[str, Any]:
@@ -452,16 +469,6 @@ def policy_visible_memory(memory: MemoryRecord) -> dict[str, Any]:
         "estimated_tokens": memory.estimated_tokens,
         "metadata": _safe_policy_metadata(memory.metadata),
     }
-
-
-def _strip_llm_hidden_fact_ids(actions: list[MemoryAction]) -> list[MemoryAction]:
-    stripped: list[MemoryAction] = []
-    for action in actions:
-        if hasattr(action, "fact_ids"):
-            stripped.append(action.model_copy(update={"fact_ids": []}))
-        else:
-            stripped.append(action)
-    return stripped
 
 
 def _safe_policy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:

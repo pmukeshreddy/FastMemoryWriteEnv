@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import threading
 from typing import Mapping
 
@@ -22,6 +21,7 @@ from fast_memory_write_env.actions import (
     StoreRawAction,
     UpdateMemoryAction,
     WriteMemoryAction,
+    deterministic_memory_id,
     validate_environment_action,
 )
 from fast_memory_write_env.index import RetrievalIndex, SearchResult, estimate_tokens
@@ -346,6 +346,7 @@ class FastMemoryWriteEnv:
         )
         previous_target_tokens = target_existing.estimated_tokens if target_existing else 0
         self._require_storage_budget(target.estimated_tokens - previous_target_tokens)
+        self._require_indexing_budget(1 if action.index_immediately else 0)
         delta = self.memory_store.upsert(target)
         for memory_id in action.source_memory_ids:
             compressed = self.memory_store.mark_status(
@@ -363,7 +364,23 @@ class FastMemoryWriteEnv:
                         token_count=target.estimated_tokens,
                     ),
                 )
+        indexed = False
+        available_at_ms = None
+        if action.index_immediately:
+            available_at_ms = _available_at_ms(
+                self.current_time_ms,
+                "compress_memory",
+                token_count=target.estimated_tokens,
+            )
+            indexed_target = self.memory_store.set_indexed(
+                target.memory_id,
+                True,
+                self.current_time_ms,
+            )
+            self.retrieval_index.upsert(_memory_available_at(indexed_target, available_at_ms))
+            indexed = True
         self._consume_storage_budget(delta)
+        self._consume_indexing_budget(1 if indexed else 0)
         return _success(
             "compress_memory",
             token_count=target.estimated_tokens,
@@ -371,6 +388,8 @@ class FastMemoryWriteEnv:
             payload={
                 "target_memory_id": action.target_memory_id,
                 "source_memory_ids": action.source_memory_ids,
+                "indexed": indexed,
+                "available_at_ms": available_at_ms,
             },
         )
 
@@ -522,12 +541,11 @@ class FastMemoryWriteEnv:
         self.indexing_budget_operations_remaining = max(0, self.indexing_budget_operations_remaining - operations)
 
 
-def deterministic_memory_id(source_event_ids: list[str], content: str, *, prefix: str = "mem") -> str:
-    """Create a stable memory ID from source event IDs and content."""
-
-    seed = "|".join([*sorted(source_event_ids), content])
-    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
-    return f"{prefix}-{digest}"
+__all__ = [
+    "BASE_LATENCY_MS",
+    "FastMemoryWriteEnv",
+    "deterministic_memory_id",
+]
 
 
 def _success(

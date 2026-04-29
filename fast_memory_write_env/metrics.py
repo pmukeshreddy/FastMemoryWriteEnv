@@ -9,7 +9,100 @@ from typing import Any, Iterable, Literal
 
 from pydantic import Field
 
+from fast_memory_write_env.llm_client import LLMClient, LLMClientError, LLMMessage
 from fast_memory_write_env.schemas import MemoryRecord, Query, StrictBaseModel
+
+
+_JUDGE_SYSTEM_PROMPT = (
+    "You are a strict grader for a question-answering system. "
+    "You judge whether a candidate answer correctly answers the user's question, "
+    "based on the provided gold answer facts. "
+    "Reply with exactly one token: YES or NO. Do not output anything else.\n\n"
+    "Reply YES only if ALL of these are true:\n"
+    "- The candidate answer is directly on-topic for the question.\n"
+    "- The candidate answer communicates every gold answer fact "
+    "(paraphrasing and re-wording are fine).\n"
+    "- The candidate answer does not contradict any gold fact.\n\n"
+    "Reply NO if ANY of these are true:\n"
+    "- The candidate is off-topic, evasive, or an abstention "
+    "(e.g. 'I don't know', 'no information').\n"
+    "- The candidate omits, contradicts, or distorts any gold fact.\n"
+    "- The candidate answers a different question than the one asked, even if "
+    "it happens to mention a gold phrase."
+)
+
+
+def _judge_answer_with_llm(
+    *,
+    question: str,
+    answer: str,
+    answer_facts: list[str],
+    llm_client: LLMClient,
+) -> bool | None:
+    """Use an LLM judge to decide whether ``answer`` is correct for ``question``.
+
+    Returns ``True``/``False`` from a deterministic YES/NO verdict, or ``None``
+    when the client errors, refuses, or returns a response that is not a
+    clear YES/NO. Callers must treat ``None`` as "unable to judge" and fall
+    back to the string-match verifier so a transient LLM failure never
+    silently flips a metric.
+    """
+
+    if not answer_facts:
+        return None
+
+    gold_block = "\n".join(f"- {fact}" for fact in answer_facts)
+    user_prompt = (
+        f"Question:\n{question.strip()}\n\n"
+        f"Candidate answer:\n{(answer or '').strip()}\n\n"
+        f"Gold answer facts (the candidate must convey ALL of them):\n"
+        f"{gold_block}\n\n"
+        "Reply with exactly YES or NO."
+    )
+    messages = [
+        LLMMessage(role="system", content=_JUDGE_SYSTEM_PROMPT),
+        LLMMessage(role="user", content=user_prompt),
+    ]
+    try:
+        response = llm_client.complete(
+            messages,
+            temperature=0.0,
+            response_format={"type": "text"},
+        )
+    except LLMClientError:
+        return None
+    except Exception:  # pragma: no cover - defensive: unexpected client failures
+        return None
+
+    verdict = (response.content or "").strip().upper()
+    if not verdict:
+        return None
+    if verdict.startswith("YES"):
+        return True
+    if verdict.startswith("NO"):
+        return False
+    return None
+
+
+def _evaluate_answer_correctness(
+    *,
+    question: str,
+    answer_text: str,
+    answer_facts: list[str],
+    llm_client: LLMClient | None,
+) -> bool:
+    """Judge with the LLM when available; fall back to the string-match verifier."""
+
+    if llm_client is not None:
+        verdict = _judge_answer_with_llm(
+            question=question,
+            answer=answer_text,
+            answer_facts=answer_facts,
+            llm_client=llm_client,
+        )
+        if verdict is not None:
+            return verdict
+    return answer_satisfies_gold_facts(answer_text, answer_facts)
 
 
 class RunConfig(StrictBaseModel):
@@ -171,8 +264,17 @@ def evaluate_query_result(
     fact_lifecycles: dict[str, FactLifecycle],
     answer_text: str,
     answer_completed_at_ms: float,
+    llm_client: LLMClient | None = None,
 ) -> QueryMetricRecord:
-    """Score one query using fact/evidence coverage instead of exact matching."""
+    """Score one query using fact/evidence coverage instead of exact matching.
+
+    When ``llm_client`` is provided, ``answer_correct`` is decided by an
+    LLM-as-judge call (see :func:`_judge_answer_with_llm`) for non-abstention
+    queries. Any judge failure transparently falls back to the legacy
+    string-match verifier so a flaky LLM never silently degrades scoring.
+    Evidence, fact-coverage, precision, recall, and time-to-useful-memory are
+    untouched.
+    """
 
     required_fact_ids = set(query.gold.required_fact_ids)
     supporting_event_ids = set(query.gold.supporting_event_ids)
@@ -223,7 +325,12 @@ def evaluate_query_result(
 
     fact_evidence_coverage = required_fact_ids.issubset(cited_fact_ids)
     evidence_correct = fact_evidence_coverage and supporting_event_ids.issubset(cited_event_ids)
-    answer_correct = answer_satisfies_gold_facts(answer_text, query.gold.answer_facts)
+    answer_correct = _evaluate_answer_correctness(
+        question=query.text,
+        answer_text=answer_text,
+        answer_facts=query.gold.answer_facts,
+        llm_client=llm_client,
+    )
     answer_success = answer_correct and evidence_correct
 
     useful_retrieved_count = sum(

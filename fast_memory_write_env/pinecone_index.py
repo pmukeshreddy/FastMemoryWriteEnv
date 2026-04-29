@@ -2,6 +2,13 @@
 
 Imports from the Pinecone SDK are intentionally lazy so unit tests can run
 without credentials or the optional external service being available.
+
+The backend takes an :class:`~fast_memory_write_env.embeddings.EmbeddingClient`
+that produces upsert/query vectors. Real runs use
+``OpenAIEmbeddingClient``; ``DeterministicEmbeddingClient`` exists only for
+the in-process Pinecone smoke test. The embedding client's declared
+dimension must match the configured Pinecone index dimension; we fail fast
+during construction if they disagree.
 """
 
 from __future__ import annotations
@@ -9,9 +16,12 @@ from __future__ import annotations
 from typing import Any
 
 from fast_memory_write_env.config import PineconeConfig
+from fast_memory_write_env.embeddings import (
+    DeterministicEmbeddingClient,
+    EmbeddingClient,
+)
 from fast_memory_write_env.index import (
     SearchResult,
-    deterministic_text_vector,
     memory_metadata,
 )
 from fast_memory_write_env.schemas import MemoryRecord, MemoryStatus
@@ -33,23 +43,44 @@ CANONICAL_MEMORY_METADATA_KEYS = {
 }
 
 
+class PineconeDimensionMismatchError(RuntimeError):
+    """Raised when an embedding client and Pinecone config disagree on dimension."""
+
+
 class PineconeIndex:
     """Real Pinecone-backed retrieval index."""
 
-    def __init__(self, config: PineconeConfig) -> None:
+    def __init__(
+        self,
+        config: PineconeConfig,
+        *,
+        embedding_client: EmbeddingClient | None = None,
+    ) -> None:
         self.config = config
+        self.embedding_client = embedding_client or DeterministicEmbeddingClient(
+            dimension=config.dimension
+        )
+        self._validate_dimensions()
         self._index = self._connect(config)
 
     @classmethod
-    def from_env(cls, *, create_if_missing: bool = False) -> PineconeIndex:
-        return cls(PineconeConfig.from_env(create_if_missing=create_if_missing))
+    def from_env(
+        cls,
+        *,
+        create_if_missing: bool = False,
+        embedding_client: EmbeddingClient | None = None,
+    ) -> PineconeIndex:
+        return cls(
+            PineconeConfig.from_env(create_if_missing=create_if_missing),
+            embedding_client=embedding_client,
+        )
 
     def upsert(self, memory: MemoryRecord) -> None:
         self._index.upsert(
             vectors=[
                 {
                     "id": memory.memory_id,
-                    "values": deterministic_text_vector(memory.content, self.config.dimension),
+                    "values": self.embedding_client.embed_one(memory.content),
                     "metadata": memory_metadata(memory),
                 }
             ],
@@ -71,7 +102,7 @@ class PineconeIndex:
         as_of_ms: float | None = None,
     ) -> list[SearchResult]:
         response = self._index.query(
-            vector=deterministic_text_vector(query, self.config.dimension),
+            vector=self.embedding_client.embed_one(query),
             top_k=top_k,
             include_metadata=True,
             namespace=self.config.namespace,
@@ -94,6 +125,14 @@ class PineconeIndex:
                 )
             )
         return results
+
+    def _validate_dimensions(self) -> None:
+        if self.embedding_client.dimension != self.config.dimension:
+            raise PineconeDimensionMismatchError(
+                "embedding client dimension does not match Pinecone index dimension: "
+                f"client={self.embedding_client.dimension}, "
+                f"index={self.config.dimension}"
+            )
 
     def _connect(self, config: PineconeConfig) -> Any:
         try:
