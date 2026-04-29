@@ -270,6 +270,8 @@ class StreamingEvaluator:
         run_config: RunConfig | dict[str, Any] | None = None,
         judge_llm_client: LLMClient | None = None,
         answer_llm_client: LLMClient | None = None,
+        queue_drain_timeout_seconds: float = 1800.0,
+        worker_stop_timeout_seconds: float = 1800.0,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -277,6 +279,15 @@ class StreamingEvaluator:
         self.storage_budget_tokens_remaining = storage_budget_tokens_remaining
         self.indexing_budget_operations_remaining = indexing_budget_operations_remaining
         self.run_config = RunConfig.model_validate(run_config or {})
+        # Real LongMemEval-style runs make one OpenAI call per turn-event and
+        # can queue thousands of events before the next query. The 30s default
+        # we used for synthetic episodes (which finish in milliseconds) will
+        # always abort early on real workloads. Default to 30 minutes; the
+        # multi-runner wires a CLI flag for fine control.
+        if queue_drain_timeout_seconds <= 0 or worker_stop_timeout_seconds <= 0:
+            raise ValueError("evaluator timeouts must be positive")
+        self.queue_drain_timeout_seconds = queue_drain_timeout_seconds
+        self.worker_stop_timeout_seconds = worker_stop_timeout_seconds
         # Default the answer-correctness judge to the policy's LLM client when
         # one is available (LLMMemoryWritePolicy exposes ``llm_client``).
         # Baselines and rule-based test policies have no client, so scoring
@@ -487,9 +498,13 @@ class StreamingEvaluator:
                     query = item.query
                     if not memory_write_queue.wait_until_no_ready_work(
                         cutoff_enqueued_at_ms=query.timestamp_ms,
-                        timeout_seconds=30.0,
+                        timeout_seconds=self.queue_drain_timeout_seconds,
                     ):
-                        raise TimeoutError("memory-write queue did not process ready work before query evaluation")
+                        raise TimeoutError(
+                            "memory-write queue did not process ready work before query evaluation "
+                            f"(timeout={self.queue_drain_timeout_seconds}s; "
+                            "raise --queue-drain-timeout-seconds for long LongMemEval rows)"
+                        )
                     search_result = self.env.execute_action_at(
                         SearchMemoryAction(
                             query_id=query.query_id,
@@ -597,7 +612,7 @@ class StreamingEvaluator:
                             )
                         )
         finally:
-            worker.stop(timeout_seconds=30.0)
+            worker.stop(timeout_seconds=self.worker_stop_timeout_seconds)
 
         with state_lock:
             final_counters = _finalize_counters(self.env.memory_store.list_all(), event_categories, counters)

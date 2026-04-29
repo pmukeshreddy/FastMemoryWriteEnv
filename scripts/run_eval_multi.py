@@ -45,6 +45,32 @@ from fast_memory_write_env.rewards import score_metrics
 from fast_memory_write_env.schemas import DatasetMode, StreamingEpisode
 
 
+def _truncate_episode_events(episode: StreamingEpisode, *, max_events: int) -> StreamingEpisode:
+    """Cap the number of event items in an episode while preserving every query.
+
+    LongMemEval rows expand to thousands of turn-events because every chat
+    turn becomes one streaming event. For honest scaled evaluation that
+    finishes in finite time, callers can cap the per-sample event count.
+    Queries are always preserved (skipping them would invalidate scoring);
+    if any required ``supporting_event_id`` is dropped, retrieval simply
+    cannot find it and the failure surfaces honestly in the metrics.
+    """
+
+    if max_events <= 0:
+        return episode
+    new_stream = []
+    kept_events = 0
+    for item in episode.stream:
+        if item.item_type == "event":
+            if kept_events >= max_events:
+                continue
+            kept_events += 1
+        new_stream.append(item)
+    if len(new_stream) == len(episode.stream):
+        return episode
+    return episode.model_copy(update={"stream": new_stream})
+
+
 def _synthetic_episode_iter(mode: DatasetMode, *, start_seed: int):
     """Yield ``(seed, episode_index, episode)`` synthetic tuples without repeats.
 
@@ -177,6 +203,8 @@ def _evaluate_one(
         evaluator.latency_budget_ms = args.latency_budget_ms
         evaluator.storage_budget_tokens_remaining = args.storage_budget
         evaluator.indexing_budget_operations_remaining = args.indexing_budget
+        evaluator.queue_drain_timeout_seconds = args.queue_drain_timeout_seconds
+        evaluator.worker_stop_timeout_seconds = args.worker_stop_timeout_seconds
         result = evaluator.evaluate_episode(episode)
         result = write_evaluation_outputs(result, episode_output)
     return result
@@ -217,6 +245,30 @@ def main() -> None:
     parser.add_argument("--latency-budget-ms", type=int, default=250)
     parser.add_argument("--storage-budget", type=int, default=10_000)
     parser.add_argument("--indexing-budget", type=int, default=3)
+    parser.add_argument(
+        "--queue-drain-timeout-seconds",
+        type=float,
+        default=1800.0,
+        help="How long the evaluator waits for the memory-write worker to "
+        "drain queued events before each query. LongMemEval rows can have "
+        "thousands of turn-events; raise this if a sample aborts.",
+    )
+    parser.add_argument(
+        "--worker-stop-timeout-seconds",
+        type=float,
+        default=1800.0,
+        help="How long the evaluator waits for the worker thread to exit "
+        "between samples. Should usually match --queue-drain-timeout-seconds.",
+    )
+    parser.add_argument(
+        "--max-events-per-sample",
+        type=int,
+        default=0,
+        help="If >0, cap the number of event items streamed per sample. "
+        "Queries are always preserved. Use this to keep wall-clock and "
+        "OpenAI cost bounded on LongMemEval (~50-100 events is enough for "
+        "a fast 20-sample sanity test; 0 means use the full episode).",
+    )
     args = parser.parse_args()
 
     if args.samples < 1:
@@ -249,6 +301,10 @@ def main() -> None:
                 f"refusing to repeat sample (seed={seed}, episode_index={episode_index})"
             )
         seen_keys.add(key)
+        if args.max_events_per_sample > 0:
+            episode = _truncate_episode_events(
+                episode, max_events=args.max_events_per_sample
+            )
         result = _evaluate_one(
             episode=episode,
             use_test_index=use_test_index,
