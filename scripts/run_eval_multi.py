@@ -217,7 +217,9 @@ def _evaluate_one(
         evaluator.queue_drain_timeout_seconds = args.queue_drain_timeout_seconds
         evaluator.worker_stop_timeout_seconds = args.worker_stop_timeout_seconds
         evaluator.show_inner_progress = show_inner
-        evaluator.debug_timing = args.debug_timing
+        # Per-event / per-query progress lines are on by default so a long
+        # run never looks frozen. --quiet suppresses them.
+        evaluator.debug_timing = not args.quiet
         evaluator.write_worker_concurrency = args.write_worker_concurrency
         try:
             result = evaluator.evaluate_episode(episode)
@@ -306,10 +308,15 @@ def main() -> None:
         "RPM/TPM. Set to 1 to disable parallelism.",
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress per-event and per-query progress lines (only the "
+        "outer samples bar is shown).",
+    )
+    parser.add_argument(
         "--debug-timing",
         action="store_true",
-        help="Print per-event and per-query wall-clock timings (decide / "
-        "compose / judge) to surface which step is the bottleneck.",
+        help="(legacy alias; per-event progress lines are now on by default)",
     )
     parser.add_argument(
         "--write-worker-concurrency",

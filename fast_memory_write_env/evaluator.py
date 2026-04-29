@@ -293,12 +293,10 @@ class _AsyncMemoryWriteWorker:
         if self.debug_timing:
             action_types = ",".join(action.action_type for action in actions) or "<none>"
             queue_depth = len(self.queue.pending_event_ids())
-            content_preview = (queue_item.event.content or "")[:60].replace("\n", " ")
             _debug_log(
-                f"event={queue_item.event.event_id} "
+                f"{self.episode_id} event={queue_item.event.event_id} "
                 f"decide={decide_elapsed:.2f}s actions={actions_elapsed:.2f}s "
-                f"actions=[{action_types}] active={len(active_memories)} "
-                f"queue={queue_depth} preview={content_preview!r}"
+                f"[{action_types}] active={len(active_memories)} queue={queue_depth}"
             )
 
         with self.state_lock:
@@ -513,6 +511,13 @@ class StreamingEvaluator:
             )
         )
         worker.start()
+        if self.debug_timing:
+            event_count = sum(1 for it in episode.stream if it.item_type == "event")
+            query_count = sum(1 for it in episode.stream if it.item_type == "query")
+            _debug_log(
+                f"{episode.episode_id} starting events={event_count} "
+                f"queries={query_count} workers={self.write_worker_concurrency}"
+            )
 
         event_count = sum(1 for it in episode.stream if it.item_type == "event")
         query_count = sum(1 for it in episode.stream if it.item_type == "query")
