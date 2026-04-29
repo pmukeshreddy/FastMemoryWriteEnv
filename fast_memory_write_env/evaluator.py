@@ -48,6 +48,7 @@ from fast_memory_write_env.metrics import (
     aggregate_metrics,
     evaluate_query_result,
     headline_metrics,
+    subtask_accuracy_breakdown,
     write_eval_summary,
     write_metrics_csv,
     write_rollout_jsonl,
@@ -764,12 +765,17 @@ class StreamingEvaluator:
                 )
             )
             aggregate = aggregate_metrics(query_metrics, final_counters)
+            lme_subtasks = (
+                subtask_accuracy_breakdown(query_metrics, rollout_records=records)
+                if run_config.dataset_mode == "longmemeval"
+                else None
+            )
             return EvaluationResult(
                 episode_id=episode.episode_id,
                 rollout_records=list(records),
                 query_metrics=list(query_metrics),
                 aggregate_metrics=aggregate,
-                score_breakdown=score_metrics(aggregate),
+                score_breakdown=score_metrics(aggregate, subtask_accuracies=lme_subtasks),
                 run_config=run_config,
             )
 
@@ -785,9 +791,19 @@ def write_evaluation_outputs(result: EvaluationResult, output_dir: str | Path) -
     write_metrics_csv(result.query_metrics, result.aggregate_metrics, metrics_path)
     write_predictions_jsonl(result.rollout_records, predictions_path)
     diagnostics = build_failure_diagnostics(result.query_metrics, result.rollout_records)
+    metrics_payload = headline_metrics(
+        result.aggregate_metrics,
+        dataset_mode=result.run_config.dataset_mode,
+        query_metrics=result.query_metrics,
+        rollout_records=result.rollout_records,
+    )
     summary = {
         "episode_id": result.episode_id,
-        "metrics": headline_metrics(result.aggregate_metrics),
+        "primary_metric": {
+            "name": "answer_success",
+            "value": result.aggregate_metrics.answer_success,
+        },
+        "metrics": metrics_payload,
         "score": result.score_breakdown.score,
         "run_config": result.run_config.model_dump(mode="json"),
         "counts": {
@@ -802,6 +818,12 @@ def write_evaluation_outputs(result: EvaluationResult, output_dir: str | Path) -
             "predictions_jsonl": str(predictions_path),
         },
     }
+    if result.run_config.dataset_mode == "longmemeval":
+        summary["subtask_accuracy"] = metrics_payload.get("subtask_accuracy", {})
+        summary["secondary_metrics"] = {
+            "total_memory_count": result.aggregate_metrics.total_memory_count,
+            "stale_memory_rate": result.aggregate_metrics.stale_memory_rate,
+        }
     write_eval_summary(summary, summary_path)
     return result.model_copy(
         update={
@@ -1087,6 +1109,11 @@ def _judge_failure_query_metric(
     return QueryMetricRecord(
         episode_id=query.episode_id,
         query_id=query.query_id,
+        question_type=(
+            "abstention"
+            if query.gold.is_abstention
+            else str(query.metadata.get("question_type") or "").strip() or None
+        ),
         query_timestamp_ms=float(query.timestamp_ms),
         answer_success=False,
         answer_correct=False,

@@ -125,9 +125,10 @@ python3 scripts/run_eval.py \
 
 Use `--mock --use-test-index` only for local adapter checks, not for real performance claims.
 
-## 8. Metrics, especially `time_to_useful_memory`
+## 8. Metrics
 
-The primary metric is `time_to_useful_memory`:
+For synthetic streaming episodes, the write-path timing diagnostic is
+`time_to_useful_memory`:
 
 ```text
 event arrives
@@ -140,13 +141,17 @@ event arrives
 
 `time_to_useful_memory` is `null` unless every required fact completes the full chain: event arrival -> raw write -> memory write/update -> index -> retrieval -> successful answer. Query retrieval is causally filtered: a query at time `T` can only retrieve memory/index versions whose simulated index availability time is at or before `T`. If a memory update completes after `T`, the query still sees the older indexed version that was available at `T`.
 
-The headline scorecard is intentionally small:
+For LongMemEval runs, `time_to_useful_memory` is not a headline metric because
+it depends heavily on where the labeled evidence appears in the stream. The
+LongMemEval headline scorecard follows the usual benchmark framing:
 
-- `time_to_useful_memory`
 - `answer_success`
+- sub-task accuracy by `question_type`
 - `memory_precision`
 - `memory_recall`
 - `storage_tokens_used`
+- `total_memory_count`
+- `stale_memory_rate`
 
 Answer success is evidence-based:
 
@@ -239,8 +244,8 @@ The configured Pinecone index must match the vector dimension expected by the cu
 Every evaluation run writes:
 
 - `raw_rollouts.jsonl`: one JSONL record per run config/event/action/query/metric trace.
-- `metrics.csv`: per-query rows with only the five reported metrics.
-- `eval_summary.json`: the five reported metrics, scalar score, run config metadata, counts, and output paths.
+- `metrics.csv`: compact per-query rows for reproducible local analysis.
+- `eval_summary.json`: the headline scorecard, scalar score, run config metadata, counts, diagnostics, and output paths. LongMemEval summaries put `answer_success` and sub-task accuracies first.
 - `predictions.jsonl`: LongMemEval-compatible rows with `question_id` and `hypothesis`.
 
 `run_config` is included in `raw_rollouts.jsonl` and `eval_summary.json`. It records dataset mode, seed, episode id, policy/client/backend names, Pinecone index name when applicable, budgets, timestamp, and the command/config used. API keys are never written; only configured/not configured booleans are recorded.

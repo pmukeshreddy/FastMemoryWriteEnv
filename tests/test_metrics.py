@@ -18,6 +18,7 @@ from fast_memory_write_env.metrics import (
     headline_metrics,
     percentile,
     read_rollout_jsonl,
+    subtask_accuracy_breakdown,
     summarize_rollout_records,
     write_metrics_csv,
     write_rollout_jsonl,
@@ -383,6 +384,108 @@ def test_headline_metrics_are_small_scorecard() -> None:
         "storage_tokens_used",
     ]
     assert headline["storage_tokens_used"] == 40
+
+
+def test_longmemeval_headline_uses_accuracy_breakdown() -> None:
+    metrics = [
+        QueryMetricRecord(
+            episode_id="ep-lme",
+            query_id="q1",
+            question_type="single-session-user",
+            query_timestamp_ms=100,
+            answer_success=True,
+            answer_correct=True,
+            evidence_correct=True,
+            memory_precision=1.0,
+            memory_recall=1.0,
+        ),
+        QueryMetricRecord(
+            episode_id="ep-lme",
+            query_id="q2",
+            question_type="single-session-user",
+            query_timestamp_ms=200,
+            answer_success=False,
+            answer_correct=False,
+            evidence_correct=False,
+            memory_precision=0.0,
+            memory_recall=0.0,
+        ),
+        QueryMetricRecord(
+            episode_id="ep-lme",
+            query_id="q3",
+            question_type="knowledge-update",
+            query_timestamp_ms=300,
+            answer_success=True,
+            answer_correct=True,
+            evidence_correct=True,
+            memory_precision=1.0,
+            memory_recall=1.0,
+        ),
+    ]
+    aggregate = aggregate_metrics(
+        metrics,
+        AggregateCounterSnapshot(
+            total_memory_count=7,
+            stale_memory_count=2,
+            storage_tokens_used=90,
+        ),
+    )
+
+    headline = headline_metrics(
+        aggregate,
+        dataset_mode=DatasetMode.LONGMEMEVAL.value,
+        query_metrics=metrics,
+    )
+
+    assert list(headline) == [
+        "answer_success",
+        "subtask_accuracy",
+        "memory_precision",
+        "memory_recall",
+        "storage_tokens_used",
+        "total_memory_count",
+        "stale_memory_rate",
+    ]
+    assert "time_to_useful_memory" not in headline
+    assert headline["answer_success"] == 2 / 3
+    assert headline["subtask_accuracy"]["single-session-user"] == {
+        "accuracy": 0.5,
+        "correct": 1,
+        "total": 2,
+    }
+    assert headline["subtask_accuracy"]["knowledge-update"]["accuracy"] == 1.0
+    assert headline["total_memory_count"] == 7
+    assert headline["stale_memory_rate"] == 2 / 7
+
+
+def test_subtask_accuracy_breakdown_can_read_legacy_rollout_query_metadata() -> None:
+    metric = QueryMetricRecord(
+        episode_id="ep-lme",
+        query_id="q-legacy",
+        query_timestamp_ms=100,
+        answer_success=True,
+        answer_correct=True,
+        evidence_correct=True,
+        memory_precision=1.0,
+        memory_recall=1.0,
+    )
+    records = [
+        RolloutRecord(
+            record_type="query",
+            episode_id="ep-lme",
+            payload={
+                "query": {
+                    "query_id": "q-legacy",
+                    "metadata": {"question_type": "multi-session"},
+                    "gold": {"is_abstention": False},
+                }
+            },
+        )
+    ]
+
+    breakdown = subtask_accuracy_breakdown([metric], rollout_records=records)
+
+    assert breakdown == {"multi-session": {"accuracy": 1.0, "correct": 1, "total": 1}}
 
 
 def test_rollout_and_metrics_serialization_round_trip(tmp_path) -> None:

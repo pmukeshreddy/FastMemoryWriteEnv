@@ -16,6 +16,7 @@ from fast_memory_write_env.dataset import SYNTHETIC_DATASET_MODES, generate_epis
 from fast_memory_write_env.evaluator import StreamingEvaluator, write_evaluation_outputs
 from fast_memory_write_env.llm_client import MockLLMClient, OpenAICompatibleLLMClient
 from fast_memory_write_env.longmemeval import load_longmemeval_episodes
+from fast_memory_write_env.metrics import subtask_accuracy_breakdown
 from fast_memory_write_env.metrics import RunConfig
 from fast_memory_write_env.policies import LLMMemoryWritePolicy
 from fast_memory_write_env.schemas import DatasetMode
@@ -86,11 +87,21 @@ def main() -> None:
     print(f"episode={result.episode_id}")
     print(f"queries={len(result.query_metrics)}")
     print(f"score={result.score_breakdown.score:.3f}")
-    print(f"time_to_useful_memory={result.aggregate_metrics.time_to_useful_memory}")
-    print(f"answer_success={result.aggregate_metrics.answer_success:.3f}")
+    print(f"answer_success={result.aggregate_metrics.answer_success:.3f} ({result.aggregate_metrics.answer_success:.1%})")
+    if result.run_config.dataset_mode == DatasetMode.LONGMEMEVAL.value:
+        print("subtask_accuracy:")
+        for question_type, payload in subtask_accuracy_breakdown(result.query_metrics).items():
+            print(
+                f"  {question_type}: {payload['accuracy']:.3f} "
+                f"({payload['correct']}/{payload['total']})"
+            )
+    else:
+        print(f"time_to_useful_memory={result.aggregate_metrics.time_to_useful_memory}")
     print(f"memory_precision={result.aggregate_metrics.memory_precision:.3f}")
     print(f"memory_recall={result.aggregate_metrics.memory_recall:.3f}")
     print(f"storage_tokens_used={result.aggregate_metrics.storage_tokens_used}")
+    print(f"total_memory_count={result.aggregate_metrics.total_memory_count}")
+    print(f"stale_memory_rate={result.aggregate_metrics.stale_memory_rate:.3f}")
     print(f"raw_rollouts={result.output_paths['raw_rollouts']}")
     print(f"metrics_csv={result.output_paths['metrics_csv']}")
     print(f"eval_summary={result.output_paths['eval_summary']}")

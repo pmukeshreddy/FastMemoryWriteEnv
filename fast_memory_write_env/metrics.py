@@ -148,6 +148,7 @@ class QueryMetricRecord(StrictBaseModel):
 
     episode_id: str
     query_id: str
+    question_type: str | None = None
     query_timestamp_ms: float
     time_to_raw_write: float | None = None
     time_to_memory_write: float | None = None
@@ -204,6 +205,7 @@ class AggregateMetrics(StrictBaseModel):
     stale_memory_rate: float = Field(ge=0.0, le=1.0)
     duplicate_memory_rate: float = Field(ge=0.0, le=1.0)
     storage_tokens_used: int = Field(ge=0)
+    total_memory_count: int = Field(default=0, ge=0)
     useful_memory_per_storage_token: float = Field(ge=0.0)
     write_latency_p50: float | None = None
     write_latency_p95: float | None = None
@@ -215,12 +217,26 @@ class AggregateMetrics(StrictBaseModel):
     query_count: int = Field(default=0, ge=0)
 
 
-HEADLINE_METRIC_FIELDS = (
+# Synthetic runs keep this small legacy scorecard for compatibility. For
+# LongMemEval, ``headline_metrics`` switches to the community-facing accuracy
+# scorecard instead of surfacing stream-position-sensitive timing as primary.
+SYNTHETIC_HEADLINE_METRIC_FIELDS = (
     "time_to_useful_memory",
     "answer_success",
     "memory_precision",
     "memory_recall",
     "storage_tokens_used",
+)
+HEADLINE_METRIC_FIELDS = SYNTHETIC_HEADLINE_METRIC_FIELDS
+
+LONGMEMEVAL_HEADLINE_METRIC_FIELDS = (
+    "answer_success",
+    "subtask_accuracy",
+    "memory_precision",
+    "memory_recall",
+    "storage_tokens_used",
+    "total_memory_count",
+    "stale_memory_rate",
 )
 
 METRICS_CSV_FIELDS = (
@@ -309,6 +325,7 @@ def evaluate_query_result(
         return QueryMetricRecord(
             episode_id=query.episode_id,
             query_id=query.query_id,
+            question_type=_question_type_for_query(query),
             query_timestamp_ms=float(query.timestamp_ms),
             answer_success=answer_success,
             answer_correct=answer_correct,
@@ -365,6 +382,7 @@ def evaluate_query_result(
     return QueryMetricRecord(
         episode_id=query.episode_id,
         query_id=query.query_id,
+        question_type=_question_type_for_query(query),
         query_timestamp_ms=float(query.timestamp_ms),
         answer_success=answer_success,
         answer_correct=answer_correct,
@@ -451,6 +469,7 @@ def aggregate_metrics(
         stale_memory_rate=_safe_div(counters.stale_memory_count, counters.total_memory_count),
         duplicate_memory_rate=_safe_div(counters.duplicate_memory_count, counters.total_memory_count),
         storage_tokens_used=counters.storage_tokens_used,
+        total_memory_count=counters.total_memory_count,
         useful_memory_per_storage_token=_safe_div(
             counters.useful_memory_count,
             counters.storage_tokens_used,
@@ -472,11 +491,74 @@ def aggregate_metrics(
     )
 
 
-def headline_metrics(metrics: AggregateMetrics) -> dict[str, Any]:
-    """Return the small scorecard used for top-level reporting."""
+def headline_metrics(
+    metrics: AggregateMetrics,
+    *,
+    dataset_mode: str | None = None,
+    query_metrics: list[QueryMetricRecord] | None = None,
+    rollout_records: list[RolloutRecord] | None = None,
+) -> dict[str, Any]:
+    """Return the scorecard used for top-level reporting.
+
+    LongMemEval papers report answer accuracy and category breakdowns. The
+    streaming freshness path is still computed for diagnostics, but it is not
+    a LongMemEval headline metric because it mostly reflects where evidence
+    appears in a row's stream.
+    """
 
     payload = metrics.model_dump(mode="json")
-    return {field: payload[field] for field in HEADLINE_METRIC_FIELDS}
+    if dataset_mode == "longmemeval":
+        subtask_table = subtask_accuracy_breakdown(
+            query_metrics or [],
+            rollout_records=rollout_records,
+        )
+        return {
+            "answer_success": payload["answer_success"],
+            "subtask_accuracy": subtask_table,
+            "memory_precision": payload["memory_precision"],
+            "memory_recall": payload["memory_recall"],
+            "storage_tokens_used": payload["storage_tokens_used"],
+            "total_memory_count": payload["total_memory_count"],
+            "stale_memory_rate": payload["stale_memory_rate"],
+        }
+    return {field: payload[field] for field in SYNTHETIC_HEADLINE_METRIC_FIELDS}
+
+
+def subtask_accuracy_breakdown(
+    query_metrics: list[QueryMetricRecord],
+    *,
+    rollout_records: list[RolloutRecord] | None = None,
+) -> dict[str, dict[str, int | float]]:
+    """Compute answer_success accuracy grouped by LongMemEval question_type.
+
+    New rollouts store ``question_type`` directly on each query metric. The
+    optional rollout fallback keeps older raw logs usable by reading the query
+    metadata from ``record_type="query"`` entries.
+    """
+
+    question_type_by_query = _question_types_from_rollout_records(rollout_records or [])
+    buckets: dict[str, dict[str, int]] = {}
+    for metric in query_metrics:
+        question_type = (
+            metric.question_type
+            or question_type_by_query.get((metric.episode_id, metric.query_id))
+            or "unknown"
+        )
+        bucket = buckets.setdefault(question_type, {"correct": 0, "total": 0})
+        bucket["total"] += 1
+        if metric.answer_success:
+            bucket["correct"] += 1
+
+    breakdown: dict[str, dict[str, int | float]] = {}
+    for question_type in sorted(buckets):
+        correct = buckets[question_type]["correct"]
+        total = buckets[question_type]["total"]
+        breakdown[question_type] = {
+            "accuracy": _safe_div(correct, total),
+            "correct": correct,
+            "total": total,
+        }
+    return breakdown
 
 
 def summarize_rollout_records(records: list[RolloutRecord]) -> tuple[list[QueryMetricRecord], AggregateMetrics]:
@@ -609,6 +691,55 @@ def answer_is_abstention(answer_text: str) -> bool:
         "unknown",
     ]
     return any(marker in normalized for marker in markers)
+
+
+def _question_type_for_query(query: Query) -> str | None:
+    """Extract the reporting bucket for a query.
+
+    LongMemEval abstention examples are reported as their own sub-task in
+    most result tables, so abstention gold takes precedence over the raw
+    metadata label when present.
+    """
+
+    if query.gold.is_abstention:
+        return "abstention"
+    value = query.metadata.get("question_type")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _question_types_from_rollout_records(
+    records: list[RolloutRecord],
+) -> dict[tuple[str, str], str]:
+    """Read question_type labels from query rollout records."""
+
+    question_types: dict[tuple[str, str], str] = {}
+    for record in records:
+        if record.record_type != "query":
+            continue
+        query_payload = record.payload.get("query")
+        if not isinstance(query_payload, dict):
+            continue
+        query_id = query_payload.get("query_id")
+        if not isinstance(query_id, str):
+            continue
+        gold = query_payload.get("gold")
+        metadata = query_payload.get("metadata")
+        is_abstention = isinstance(gold, dict) and bool(gold.get("is_abstention"))
+        if is_abstention:
+            question_types[(record.episode_id, query_id)] = "abstention"
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        question_type = metadata.get("question_type")
+        if question_type is None:
+            continue
+        question_type_text = str(question_type).strip()
+        if question_type_text:
+            question_types[(record.episode_id, query_id)] = question_type_text
+    return question_types
 
 
 def _event_fact_ids_from_lifecycles(

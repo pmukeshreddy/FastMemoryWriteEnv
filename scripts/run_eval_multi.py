@@ -42,6 +42,7 @@ from fast_memory_write_env.metrics import (
     RunConfig,
     aggregate_metrics,
     headline_metrics,
+    subtask_accuracy_breakdown,
 )
 from fast_memory_write_env.policies import LLMMemoryWritePolicy
 from fast_memory_write_env.rewards import score_metrics
@@ -349,6 +350,7 @@ def main() -> None:
 
     per_episode_summaries: list[dict] = []
     all_query_metrics = []
+    all_rollout_records = []
     all_counters: list[AggregateCounterSnapshot] = []
     all_diagnostics: list[dict] = []
     total_queries = 0
@@ -440,6 +442,7 @@ def main() -> None:
         ep_queries = len(result.query_metrics)
         total_queries += ep_queries
         all_query_metrics.extend(result.query_metrics)
+        all_rollout_records.extend(result.rollout_records)
         all_counters.append(_extract_counters_from_records(result.rollout_records))
         all_diagnostics.append(
             {
@@ -458,7 +461,12 @@ def main() -> None:
                 "episode_id": result.episode_id,
                 "queries": ep_queries,
                 "score": result.score_breakdown.score,
-                "metrics": headline_metrics(result.aggregate_metrics),
+                "metrics": headline_metrics(
+                    result.aggregate_metrics,
+                    dataset_mode=result.run_config.dataset_mode,
+                    query_metrics=result.query_metrics,
+                    rollout_records=result.rollout_records,
+                ),
             }
         )
         samples_bar.set_postfix(
@@ -483,7 +491,12 @@ def main() -> None:
 
     merged_counters = _merge_counters(all_counters)
     merged_aggregate = aggregate_metrics(all_query_metrics, merged_counters)
-    merged_score = score_metrics(merged_aggregate)
+    merged_subtasks = (
+        subtask_accuracy_breakdown(all_query_metrics, rollout_records=all_rollout_records)
+        if args.dataset == "longmemeval"
+        else None
+    )
+    merged_score = score_metrics(merged_aggregate, subtask_accuracies=merged_subtasks)
 
     failure_stage_totals = {
         "raw_written": 0,
@@ -505,7 +518,8 @@ def main() -> None:
         total_plan_errors += d.get("policy_plan_error_count", 0)
 
     summary = {
-        "mode": mode.value,
+        "dataset": args.dataset,
+        "mode": DatasetMode.LONGMEMEVAL.value if args.dataset == "longmemeval" else mode.value,
         "samples": args.samples,
         "samples_succeeded": episodes_run,
         "samples_failed": len(sample_failures),
@@ -517,13 +531,24 @@ def main() -> None:
         ],
         "aggregate": {
             "score": merged_score.score,
-            "metrics": headline_metrics(merged_aggregate),
+            "primary_metric": {
+                "name": "answer_success",
+                "value": merged_aggregate.answer_success,
+            },
+            "metrics": headline_metrics(
+                merged_aggregate,
+                dataset_mode=DatasetMode.LONGMEMEVAL.value if args.dataset == "longmemeval" else mode.value,
+                query_metrics=all_query_metrics,
+                rollout_records=all_rollout_records,
+            ),
+            "subtask_accuracy": merged_subtasks or {},
             "answer_success": merged_aggregate.answer_success,
             "answer_correct": merged_aggregate.answer_correct,
             "evidence_correct": merged_aggregate.evidence_correct,
             "memory_precision": merged_aggregate.memory_precision,
             "memory_recall": merged_aggregate.memory_recall,
             "stale_memory_rate": merged_aggregate.stale_memory_rate,
+            "total_memory_count": merged_aggregate.total_memory_count,
             "stored_noise_rate": merged_aggregate.stored_noise_rate,
             "ignored_useful_fact_rate": merged_aggregate.ignored_useful_fact_rate,
             "storage_tokens_used": merged_aggregate.storage_tokens_used,
@@ -555,12 +580,20 @@ def main() -> None:
         print("=" * 72)
     print(f"AGGREGATE: samples={episodes_run}/{args.samples} (distinct episodes) queries={total_queries}")
     print(f"  score                 = {merged_score.score:.3f}")
-    print(f"  answer_success        = {merged_aggregate.answer_success:.3f}")
+    print(f"  answer_success        = {merged_aggregate.answer_success:.3f} ({merged_aggregate.answer_success:.1%})")
+    if args.dataset == "longmemeval":
+        print("SUB-TASK ACCURACY:")
+        for question_type, payload in (merged_subtasks or {}).items():
+            print(
+                f"  {question_type:<24} {payload['accuracy']:.3f} "
+                f"({payload['correct']}/{payload['total']})"
+            )
     print(f"  answer_correct        = {merged_aggregate.answer_correct:.3f}")
     print(f"  evidence_correct      = {merged_aggregate.evidence_correct:.3f}")
     print(f"  memory_precision      = {merged_aggregate.memory_precision:.3f}")
     print(f"  memory_recall         = {merged_aggregate.memory_recall:.3f}")
     print(f"  storage_tokens_used   = {merged_aggregate.storage_tokens_used}")
+    print(f"  total_memory_count    = {merged_aggregate.total_memory_count}")
     print(f"  stale_memory_rate     = {merged_aggregate.stale_memory_rate:.3f}")
     print(f"  ignored_useful_fact_rate = {merged_aggregate.ignored_useful_fact_rate:.3f}")
     print(f"  stored_noise_rate     = {merged_aggregate.stored_noise_rate:.3f}")
