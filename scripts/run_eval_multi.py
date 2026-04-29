@@ -392,18 +392,51 @@ def main() -> None:
         return seed, episode_index, sample_slot, result
 
     if args.concurrent_samples == 1:
-        completed = (_run_one(entry) for entry in plan)
+        def _iter_outcomes():
+            for entry in plan:
+                try:
+                    yield "ok", _run_one(entry), entry
+                except BaseException as exc:  # pragma: no cover - surfaced in summary
+                    yield "error", exc, entry
+        completed = _iter_outcomes()
     else:
         executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=args.concurrent_samples,
             thread_name_prefix="fmwe-sample",
         )
-        futures = [executor.submit(_run_one, entry) for entry in plan]
-        completed = (f.result() for f in concurrent.futures.as_completed(futures))
+        future_to_entry = {executor.submit(_run_one, entry): entry for entry in plan}
+        def _iter_outcomes():
+            for future in concurrent.futures.as_completed(future_to_entry):
+                entry = future_to_entry[future]
+                exc = future.exception()
+                if exc is not None:
+                    yield "error", exc, entry
+                else:
+                    yield "ok", future.result(), entry
+        completed = _iter_outcomes()
 
     completion_index = 0
-    for seed, episode_index, sample_slot, result in completed:
+    sample_failures: list[dict[str, Any]] = []
+    for outcome, payload, plan_entry in completed:
         completion_index += 1
+        if outcome == "error":
+            seed, episode_index, _episode, sample_slot = plan_entry
+            err_text = f"{type(payload).__name__}: {payload}"
+            sample_failures.append(
+                {
+                    "sample_slot": sample_slot,
+                    "seed": seed,
+                    "episode_index": episode_index,
+                    "error": err_text,
+                }
+            )
+            samples_bar.update(1)
+            tqdm.write(
+                f"[{completion_index:02d}/{args.samples:02d}] slot={sample_slot:02d} "
+                f"seed={seed} idx={episode_index} FAILED: {err_text}"
+            )
+            continue
+        seed, episode_index, sample_slot, result = payload
         ep_queries = len(result.query_metrics)
         total_queries += ep_queries
         all_query_metrics.extend(result.query_metrics)
@@ -446,7 +479,7 @@ def main() -> None:
     samples_bar.close()
     if args.concurrent_samples > 1:
         executor.shutdown(wait=True)
-    episodes_run = args.samples
+    episodes_run = args.samples - len(sample_failures)
 
     merged_counters = _merge_counters(all_counters)
     merged_aggregate = aggregate_metrics(all_query_metrics, merged_counters)
@@ -474,6 +507,9 @@ def main() -> None:
     summary = {
         "mode": mode.value,
         "samples": args.samples,
+        "samples_succeeded": episodes_run,
+        "samples_failed": len(sample_failures),
+        "sample_failures": sample_failures,
         "episodes_run": episodes_run,
         "total_queries": total_queries,
         "unique_sample_keys": [
@@ -506,7 +542,18 @@ def main() -> None:
 
     print()
     print("=" * 72)
-    print(f"AGGREGATE: samples={args.samples} (distinct episodes) queries={total_queries}")
+    if sample_failures:
+        print(
+            f"WARNING: {len(sample_failures)}/{args.samples} samples failed; "
+            f"aggregate computed on the remaining {episodes_run} samples"
+        )
+        for failure in sample_failures:
+            print(
+                f"  failed slot={failure['sample_slot']:02d} seed={failure['seed']} "
+                f"idx={failure['episode_index']}: {failure['error']}"
+            )
+        print("=" * 72)
+    print(f"AGGREGATE: samples={episodes_run}/{args.samples} (distinct episodes) queries={total_queries}")
     print(f"  score                 = {merged_score.score:.3f}")
     print(f"  answer_success        = {merged_aggregate.answer_success:.3f}")
     print(f"  answer_correct        = {merged_aggregate.answer_correct:.3f}")

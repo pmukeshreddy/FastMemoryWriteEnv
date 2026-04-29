@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Literal, Protocol
@@ -61,6 +63,9 @@ class OpenAICompatibleLLMClient:
         base_url: str | None = None,
         model: str | None = None,
         timeout_seconds: float = 30.0,
+        max_retries: int = 5,
+        retry_initial_seconds: float = 1.0,
+        retry_max_seconds: float = 30.0,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -68,6 +73,15 @@ class OpenAICompatibleLLMClient:
         self.base_url = (base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
         self.model = model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         self.timeout_seconds = timeout_seconds
+        # OpenAI returns 429 (and sometimes 5xx) under load. Production SDKs
+        # all retry with exponential backoff and respect the Retry-After
+        # header. Without retries, a single rate-limit window kills a long
+        # run; with them, the client coasts through TPM bursts.
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        self.max_retries = max_retries
+        self.retry_initial_seconds = retry_initial_seconds
+        self.retry_max_seconds = retry_max_seconds
 
     def complete(
         self,
@@ -82,23 +96,44 @@ class OpenAICompatibleLLMClient:
             "temperature": temperature,
             "response_format": response_format or {"type": "json_object"},
         }
-        request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise LLMClientError(f"OpenAI-compatible request failed: {exc.code} {body}") from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise LLMClientError(f"OpenAI-compatible request failed: {exc}") from exc
+        body_bytes = json.dumps(payload).encode("utf-8")
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            request = urllib.request.Request(
+                f"{self.base_url}/chat/completions",
+                data=body_bytes,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    response_payload = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                err_body = exc.read().decode("utf-8", errors="replace")
+                if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
+                    sleep_seconds = self._retry_delay_seconds(exc, attempt)
+                    time.sleep(sleep_seconds)
+                    last_error = exc
+                    continue
+                raise LLMClientError(
+                    f"OpenAI-compatible request failed: {exc.code} {err_body}"
+                ) from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if attempt < self.max_retries:
+                    time.sleep(self._retry_delay_seconds(None, attempt))
+                    last_error = exc
+                    continue
+                raise LLMClientError(f"OpenAI-compatible request failed: {exc}") from exc
+            except json.JSONDecodeError as exc:
+                raise LLMClientError(f"OpenAI-compatible request failed: {exc}") from exc
+        else:  # pragma: no cover - loop fell through without break or raise
+            raise LLMClientError(
+                f"OpenAI-compatible request failed after {self.max_retries + 1} attempts: {last_error}"
+            )
 
         try:
             message = response_payload["choices"][0]["message"]
@@ -116,6 +151,25 @@ class OpenAICompatibleLLMClient:
             model=str(response_payload.get("model") or self.model),
             raw=response_payload,
         )
+
+    def _retry_delay_seconds(
+        self,
+        exc: urllib.error.HTTPError | None,
+        attempt: int,
+    ) -> float:
+        """Exponential backoff with jitter, honouring ``Retry-After`` if present."""
+
+        if exc is not None:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            if retry_after:
+                try:
+                    delay = float(retry_after)
+                    return min(self.retry_max_seconds, max(0.1, delay))
+                except ValueError:
+                    pass
+        backoff = self.retry_initial_seconds * (2 ** attempt)
+        # Full jitter: pick uniformly in [0, backoff] then cap.
+        return min(self.retry_max_seconds, random.uniform(0.0, backoff))
 
     def complete_json(
         self,
