@@ -238,7 +238,7 @@ class _AsyncMemoryWriteWorker:
                 proposals,
                 active_memory_ids=active_memory_ids,
             )
-        except PolicyPlanError as exc:
+        except (PolicyPlanError, LLMClientError) as exc:
             with self.state_lock:
                 self.records.append(
                     RolloutRecord(
@@ -247,7 +247,7 @@ class _AsyncMemoryWriteWorker:
                         timestamp_ms=float(queue_item.event.timestamp_ms),
                         logical_time_ms=logical_time_ms,
                         payload={
-                            "policy_plan_error": str(exc),
+                            "policy_plan_error": f"{type(exc).__name__}: {exc}",
                             "event_id": queue_item.event.event_id,
                             "active_memory_ids": active_memory_ids,
                         },
