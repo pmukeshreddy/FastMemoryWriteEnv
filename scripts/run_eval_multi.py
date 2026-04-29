@@ -23,6 +23,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tqdm.auto import tqdm
+
 from fast_memory_write_env.dataset import (
     SYNTHETIC_DATASET_MODES,
     generate_dataset,
@@ -293,6 +295,14 @@ def main() -> None:
     total_queries = 0
     seen_keys: set[tuple[int, int | None]] = set()
 
+    samples_bar = tqdm(
+        total=args.samples,
+        desc="samples",
+        unit="sample",
+        leave=True,
+        dynamic_ncols=True,
+        position=0,
+    )
     for sample_slot in range(args.samples):
         seed, episode_index, episode = next(iterator)
         key = (seed, episode_index)
@@ -336,13 +346,22 @@ def main() -> None:
                 "metrics": headline_metrics(result.aggregate_metrics),
             }
         )
-        print(
+        samples_bar.set_postfix(
+            seed=seed,
+            idx=episode_index,
+            ep=result.episode_id,
+            score=f"{result.score_breakdown.score:.2f}",
+            success=f"{result.aggregate_metrics.answer_success:.2f}",
+        )
+        samples_bar.update(1)
+        tqdm.write(
             f"[{sample_slot + 1:02d}/{args.samples:02d}] "
             f"seed={seed} idx={episode_index} episode={result.episode_id} "
             f"queries={ep_queries} score={result.score_breakdown.score:.3f} "
             f"answer_success={result.aggregate_metrics.answer_success:.3f}"
         )
 
+    samples_bar.close()
     episodes_run = args.samples
 
     merged_counters = _merge_counters(all_counters)

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tqdm.auto import tqdm
+
 from pydantic import Field
 
 from fast_memory_write_env.actions import (
@@ -433,9 +435,34 @@ class StreamingEvaluator:
         )
         worker.start()
 
+        event_count = sum(1 for it in episode.stream if it.item_type == "event")
+        query_count = sum(1 for it in episode.stream if it.item_type == "query")
+        progress_bar = tqdm(
+            total=len(episode.stream),
+            desc=f"{episode.episode_id}",
+            unit="item",
+            leave=True,
+            dynamic_ncols=True,
+        )
+        events_processed = 0
+        queries_processed = 0
         try:
             for item in episode.stream:
                 logical_time_ms = max(logical_time_ms, float(item.timestamp_ms))
+                if item.item_type == "event":
+                    progress_bar.set_postfix(
+                        phase="event",
+                        events=f"{events_processed + 1}/{event_count}",
+                        queries=f"{queries_processed}/{query_count}",
+                        queue=len(memory_write_queue.pending_event_ids()),
+                    )
+                else:
+                    progress_bar.set_postfix(
+                        phase="query (waiting on queue + LLM)",
+                        events=f"{events_processed}/{event_count}",
+                        queries=f"{queries_processed + 1}/{query_count}",
+                        queue=len(memory_write_queue.pending_event_ids()),
+                    )
                 if item.item_type == "event":
                     event = item.event
                     with state_lock:
@@ -611,7 +638,19 @@ class StreamingEvaluator:
                                 payload=metric.model_dump(mode="json"),
                             )
                         )
+                if item.item_type == "event":
+                    events_processed += 1
+                else:
+                    queries_processed += 1
+                progress_bar.update(1)
+                progress_bar.set_postfix(
+                    phase="idle" if (events_processed + queries_processed) == len(episode.stream) else "advancing",
+                    events=f"{events_processed}/{event_count}",
+                    queries=f"{queries_processed}/{query_count}",
+                    queue=len(memory_write_queue.pending_event_ids()),
+                )
         finally:
+            progress_bar.close()
             worker.stop(timeout_seconds=self.worker_stop_timeout_seconds)
 
         with state_lock:
