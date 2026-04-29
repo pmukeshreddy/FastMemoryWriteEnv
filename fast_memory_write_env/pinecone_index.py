@@ -15,6 +15,23 @@ from __future__ import annotations
 
 from typing import Any
 
+# Import the SDK once at module load (single-threaded). pinecone v7 uses
+# lazy module-level imports; resolving ``Pinecone`` and ``ServerlessSpec``
+# concurrently from worker threads races against pinecone's ``__getattr__``
+# and the losers see ``cannot import name 'ServerlessSpec' from 'pinecone'``
+# even though the package is installed correctly. Loading them here forces
+# the resolution to happen exactly once at import time, before the multi-
+# runner spawns its thread pool.
+try:
+    from pinecone import Pinecone as _PineconeClient
+    from pinecone import ServerlessSpec as _PineconeServerlessSpec
+except ImportError as _pinecone_import_error:  # pragma: no cover - real-run path
+    _PineconeClient = None  # type: ignore[assignment]
+    _PineconeServerlessSpec = None  # type: ignore[assignment]
+    _PINECONE_IMPORT_ERROR: ImportError | None = _pinecone_import_error
+else:
+    _PINECONE_IMPORT_ERROR = None
+
 from fast_memory_write_env.config import PineconeConfig
 from fast_memory_write_env.embeddings import (
     DeterministicEmbeddingClient,
@@ -150,15 +167,13 @@ class PineconeIndex:
             )
 
     def _connect(self, config: PineconeConfig) -> Any:
-        try:
-            from pinecone import Pinecone, ServerlessSpec
-        except ImportError as exc:
+        if _PineconeClient is None or _PineconeServerlessSpec is None:
             raise RuntimeError(
                 "The pinecone package is required for PineconeIndex. "
                 "Install project dependencies before real runs."
-            ) from exc
+            ) from _PINECONE_IMPORT_ERROR
 
-        client = Pinecone(api_key=config.api_key)
+        client = _PineconeClient(api_key=config.api_key)
         if config.create_if_missing:
             index_names = _list_index_names(client)
             if config.index_name not in index_names:
@@ -166,7 +181,7 @@ class PineconeIndex:
                     name=config.index_name,
                     dimension=config.dimension,
                     metric=config.metric,
-                    spec=ServerlessSpec(cloud=config.cloud, region=config.region),
+                    spec=_PineconeServerlessSpec(cloud=config.cloud, region=config.region),
                 )
         return client.Index(config.index_name)
 
