@@ -118,6 +118,22 @@ class AggregateMetrics(StrictBaseModel):
     query_count: int = Field(default=0, ge=0)
 
 
+HEADLINE_METRIC_FIELDS = (
+    "time_to_useful_memory",
+    "answer_success",
+    "memory_precision",
+    "memory_recall",
+    "storage_tokens_used",
+)
+
+METRICS_CSV_FIELDS = (
+    "episode_id",
+    "query_id",
+    "query_timestamp_ms",
+    *HEADLINE_METRIC_FIELDS,
+)
+
+
 class RolloutRecord(StrictBaseModel):
     """JSONL-safe rollout record."""
 
@@ -339,6 +355,13 @@ def aggregate_metrics(
     )
 
 
+def headline_metrics(metrics: AggregateMetrics) -> dict[str, Any]:
+    """Return the small scorecard used for top-level reporting."""
+
+    payload = metrics.model_dump(mode="json")
+    return {field: payload[field] for field in HEADLINE_METRIC_FIELDS}
+
+
 def summarize_rollout_records(records: list[RolloutRecord]) -> tuple[list[QueryMetricRecord], AggregateMetrics]:
     """Rebuild query metrics and aggregate summary from rollout JSONL records."""
 
@@ -389,17 +412,23 @@ def write_metrics_csv(
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    aggregate_payload = aggregate.model_dump(mode="json")
     rows = []
     for metric in query_metrics:
-        row = metric.model_dump(mode="json")
-        for key, value in aggregate_payload.items():
-            row[f"aggregate_{key}"] = value
-        rows.append(row)
+        rows.append(
+            {
+                "episode_id": metric.episode_id,
+                "query_id": metric.query_id,
+                "query_timestamp_ms": metric.query_timestamp_ms,
+                "time_to_useful_memory": metric.time_to_useful_memory,
+                "answer_success": metric.answer_success,
+                "memory_precision": metric.memory_precision,
+                "memory_recall": metric.memory_recall,
+                "storage_tokens_used": aggregate.storage_tokens_used,
+            }
+        )
 
-    fieldnames = list(rows[0].keys()) if rows else list(QueryMetricRecord.model_fields)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=list(METRICS_CSV_FIELDS))
         writer.writeheader()
         for row in rows:
             writer.writerow({key: _csv_value(value) for key, value in row.items()})
@@ -408,7 +437,7 @@ def write_metrics_csv(
 def write_eval_summary(summary: dict[str, Any], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
 
 def _max_delta(lifecycles: list[FactLifecycle], attr: str) -> float | None:

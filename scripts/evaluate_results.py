@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fast_memory_write_env.metrics import (
     extract_run_config,
+    headline_metrics,
     read_rollout_jsonl,
     summarize_rollout_records,
     write_eval_summary,
@@ -35,8 +36,8 @@ def main() -> None:
     write_metrics_csv(query_metrics, aggregate, metrics_path)
     write_eval_summary(
         {
-            "aggregate_metrics": aggregate.model_dump(mode="json"),
-            "score_breakdown": score.model_dump(mode="json"),
+            "metrics": headline_metrics(aggregate),
+            "score": score.score,
             "run_config": run_config.model_dump(mode="json") if run_config is not None else None,
             "counts": {
                 "rollout_records": len(records),
@@ -52,6 +53,11 @@ def main() -> None:
     )
     print(f"query_metrics={len(query_metrics)}")
     print(f"score={score.score:.3f}")
+    print(f"time_to_useful_memory={aggregate.time_to_useful_memory}")
+    print(f"answer_success={aggregate.answer_success:.3f}")
+    print(f"memory_precision={aggregate.memory_precision:.3f}")
+    print(f"memory_recall={aggregate.memory_recall:.3f}")
+    print(f"storage_tokens_used={aggregate.storage_tokens_used}")
     print(f"metrics_csv={metrics_path}")
     print(f"eval_summary={summary_path}")
 

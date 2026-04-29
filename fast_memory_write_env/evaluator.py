@@ -29,6 +29,7 @@ from fast_memory_write_env.metrics import (
     RolloutRecord,
     aggregate_metrics,
     evaluate_query_result,
+    headline_metrics,
     write_eval_summary,
     write_metrics_csv,
     write_rollout_jsonl,
@@ -525,8 +526,8 @@ def write_evaluation_outputs(result: EvaluationResult, output_dir: str | Path) -
     write_predictions_jsonl(result.rollout_records, predictions_path)
     summary = {
         "episode_id": result.episode_id,
-        "aggregate_metrics": result.aggregate_metrics.model_dump(mode="json"),
-        "score_breakdown": result.score_breakdown.model_dump(mode="json"),
+        "metrics": headline_metrics(result.aggregate_metrics),
+        "score": result.score_breakdown.score,
         "run_config": result.run_config.model_dump(mode="json"),
         "counts": {
             "rollout_records": len(result.rollout_records),

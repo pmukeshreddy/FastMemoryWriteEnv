@@ -15,6 +15,7 @@ from fast_memory_write_env.metrics import (
     compute_time_breakdown,
     evaluate_query_result,
     extract_run_config,
+    headline_metrics,
     percentile,
     read_rollout_jsonl,
     summarize_rollout_records,
@@ -318,6 +319,36 @@ def test_aggregate_metrics_rates_and_latencies() -> None:
     assert aggregate.stored_noise_rate == 0.25
 
 
+def test_headline_metrics_are_small_scorecard() -> None:
+    aggregate = aggregate_metrics(
+        [
+            QueryMetricRecord(
+                episode_id="ep",
+                query_id="q1",
+                query_timestamp_ms=100,
+                time_to_useful_memory=25,
+                answer_success=True,
+                answer_correct=True,
+                evidence_correct=True,
+                memory_precision=1.0,
+                memory_recall=1.0,
+            )
+        ],
+        AggregateCounterSnapshot(storage_tokens_used=40),
+    )
+
+    headline = headline_metrics(aggregate)
+
+    assert list(headline) == [
+        "time_to_useful_memory",
+        "answer_success",
+        "memory_precision",
+        "memory_recall",
+        "storage_tokens_used",
+    ]
+    assert headline["storage_tokens_used"] == 40
+
+
 def test_rollout_and_metrics_serialization_round_trip(tmp_path) -> None:
     metric = QueryMetricRecord(
         episode_id="ep",
@@ -354,8 +385,18 @@ def test_rollout_and_metrics_serialization_round_trip(tmp_path) -> None:
     assert aggregate.query_count == 1
     with csv_path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
+    assert list(rows[0].keys()) == [
+        "episode_id",
+        "query_id",
+        "query_timestamp_ms",
+        "time_to_useful_memory",
+        "answer_success",
+        "memory_precision",
+        "memory_recall",
+        "storage_tokens_used",
+    ]
     assert rows[0]["query_id"] == "q1"
-    assert json.loads(rows[0]["cited_memory_ids"]) == []
+    assert rows[0]["storage_tokens_used"] == "5"
 
 
 def test_streaming_evaluator_writes_required_outputs(tmp_path) -> None:
@@ -382,6 +423,16 @@ def test_streaming_evaluator_writes_required_outputs(tmp_path) -> None:
     assert run_config is not None
     assert run_config.dataset_mode == DatasetMode.SMALL.value
     assert run_config.backend_type == "in_memory_test"
+    assert list(summary["metrics"]) == [
+        "time_to_useful_memory",
+        "answer_success",
+        "memory_precision",
+        "memory_recall",
+        "storage_tokens_used",
+    ]
+    assert "debug_metrics" not in summary
+    assert "score_breakdown" not in summary
+    assert "score" in summary
     assert summary["run_config"]["dataset_mode"] == DatasetMode.SMALL.value
     assert any(record.record_type == "run_config" for record in records)
     assert any(

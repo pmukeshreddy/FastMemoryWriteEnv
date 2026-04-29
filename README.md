@@ -138,26 +138,15 @@ event arrives
 -> answer uses it correctly
 ```
 
-`time_to_useful_memory` is `null` unless every required fact completes the full chain: event arrival -> raw write -> memory write/update -> index -> retrieval -> successful answer. Query retrieval is causally filtered: a query at time `T` can only retrieve memory/index versions whose simulated index availability time is at or before `T`. If a memory update completes after `T`, the query still sees the older indexed version that was available at `T`. The breakdown fields remain useful when only part of the path completed.
+`time_to_useful_memory` is `null` unless every required fact completes the full chain: event arrival -> raw write -> memory write/update -> index -> retrieval -> successful answer. Query retrieval is causally filtered: a query at time `T` can only retrieve memory/index versions whose simulated index availability time is at or before `T`. If a memory update completes after `T`, the query still sees the older indexed version that was available at `T`.
 
-The environment also reports:
+The headline scorecard is intentionally small:
 
-- `time_to_raw_write`
-- `time_to_memory_write`
-- `time_to_indexed_memory`
-- `time_to_retrieved_memory`
+- `time_to_useful_memory`
 - `answer_success`
-- `answer_correct`
-- `evidence_correct`
 - `memory_precision`
 - `memory_recall`
-- `stale_memory_rate`
-- `duplicate_memory_rate`
 - `storage_tokens_used`
-- `useful_memory_per_storage_token`
-- write, index, and query latency percentiles
-- `ignored_useful_fact_rate`
-- `stored_noise_rate`
 
 Answer success is evidence-based:
 
@@ -250,8 +239,8 @@ The configured Pinecone index must match the vector dimension expected by the cu
 Every evaluation run writes:
 
 - `raw_rollouts.jsonl`: one JSONL record per run config/event/action/query/metric trace.
-- `metrics.csv`: per-query metrics with aggregate fields.
-- `eval_summary.json`: aggregate metrics, score breakdown, run config metadata, counts, and output paths.
+- `metrics.csv`: per-query rows with only the five reported metrics.
+- `eval_summary.json`: the five reported metrics, scalar score, run config metadata, counts, and output paths.
 - `predictions.jsonl`: LongMemEval-compatible rows with `question_id` and `hypothesis`.
 
 `run_config` is included in `raw_rollouts.jsonl` and `eval_summary.json`. It records dataset mode, seed, episode id, policy/client/backend names, Pinecone index name when applicable, budgets, timestamp, and the command/config used. API keys are never written; only configured/not configured booleans are recorded.
