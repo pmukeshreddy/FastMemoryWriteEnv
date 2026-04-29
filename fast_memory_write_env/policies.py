@@ -37,6 +37,21 @@ POLICY_SAFE_METADATA_KEYS = {
 }
 
 
+# Per-decision context caps. Without these the policy prompt grows
+# unboundedly across a long stream (every active memory + every recent
+# event re-serialized into every call), which is the dominant per-event
+# latency cost on real LongMemEval workloads. The caps trade a small
+# amount of long-tail context for ~3-5x faster decide latency.
+POLICY_MAX_ACTIVE_MEMORIES = 8
+POLICY_MAX_RECENT_EVENTS = 2
+
+# Cap the per-decision action list. Production LongMemEval turns rarely
+# need more than two or three coordinated actions per event. A hard upper
+# bound also defends against the LLM emitting a long action list, hitting
+# one validation error, and pushing the whole decide into a repair retry.
+POLICY_MAX_ACTIONS_PER_DECISION = 4
+
+
 def memory_action_response_format() -> dict[str, Any]:
     """OpenAI Structured Outputs schema for validated policy proposals."""
 
@@ -55,6 +70,7 @@ def memory_action_response_format() -> dict[str, Any]:
                     "actions": {
                         "type": "array",
                         "minItems": 1,
+                        "maxItems": POLICY_MAX_ACTIONS_PER_DECISION,
                         "items": {
                             "anyOf": [
                                 _strict_action_schema(
@@ -243,6 +259,17 @@ class LLMMemoryWritePolicy:
         recent_events: list[RawEvent],
         budget: MemoryWriteBudget,
     ) -> list[LLMMessage]:
+        # Bound the per-decision prompt so the policy call stays fast even
+        # late in a long stream. Most-recently-updated memories are the
+        # ones the LLM is most likely to reference for update_memory /
+        # mark_stale; older active memories remain in the store and become
+        # visible again whenever they are touched.
+        trimmed_active = sorted(
+            active_memories,
+            key=lambda memory: memory.updated_at_ms,
+            reverse=True,
+        )[:POLICY_MAX_ACTIVE_MEMORIES]
+        trimmed_recent = list(recent_events)[-POLICY_MAX_RECENT_EVENTS:]
         system = (
             "You are LLMMemoryWritePolicy for FastMemoryWriteEnv. "
             "Decide what memory actions to propose for the new raw event under the budgets. "
@@ -251,12 +278,14 @@ class LLMMemoryWritePolicy:
             "ignore_event, compress_memory, index_now, delay_index. "
             "The environment owns memory IDs: never include memory_id on write_memory or "
             "target_memory_id on compress_memory. Existing-memory actions may only reference "
-            "memory_ids that appear in active_memories."
+            "memory_ids that appear in active_memories. "
+            f"Emit at most {POLICY_MAX_ACTIONS_PER_DECISION} actions per response; "
+            "prefer one or two focused actions over long action lists."
         )
         user_payload = {
             "new_event": policy_visible_event(new_event),
-            "active_memories": [policy_visible_memory(memory) for memory in active_memories],
-            "recent_events": [policy_visible_event(event) for event in recent_events],
+            "active_memories": [policy_visible_memory(memory) for memory in trimmed_active],
+            "recent_events": [policy_visible_event(event) for event in trimmed_recent],
             "budgets": budget.model_dump(mode="json"),
             "response_contract": {
                 "shape": {"actions": ["memory action objects"]},
