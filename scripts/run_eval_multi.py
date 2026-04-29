@@ -33,6 +33,7 @@ from fast_memory_write_env.evaluator import (
     write_evaluation_outputs,
 )
 from fast_memory_write_env.llm_client import MockLLMClient, OpenAICompatibleLLMClient
+from fast_memory_write_env.longmemeval import load_longmemeval_episodes
 from fast_memory_write_env.metrics import (
     AggregateCounterSnapshot,
     RunConfig,
@@ -44,12 +45,12 @@ from fast_memory_write_env.rewards import score_metrics
 from fast_memory_write_env.schemas import DatasetMode, StreamingEpisode
 
 
-def _episode_iter(mode: DatasetMode, *, start_seed: int):
-    """Yield ``(seed, episode_index, episode)`` tuples without repeats.
+def _synthetic_episode_iter(mode: DatasetMode, *, start_seed: int):
+    """Yield ``(seed, episode_index, episode)`` synthetic tuples without repeats.
 
-    Walks seeds incrementally; for each seed yields every episode in the
-    generated dataset (``episode_count`` per mode). Each tuple is unique
-    because every (seed, episode_index) pair is hit at most once.
+    Note: the synthetic generator uses one fixed story template per episode
+    and only varies entity names / noise / ordering across seeds. For genuine
+    question diversity use ``--dataset longmemeval`` instead.
     """
 
     seed = start_seed
@@ -58,6 +59,28 @@ def _episode_iter(mode: DatasetMode, *, start_seed: int):
         for episode in dataset.episodes:
             yield seed, episode.metadata.get("episode_index"), episode
         seed += 1
+
+
+def _longmemeval_episode_iter(path: str, *, start_index: int):
+    """Yield ``(seed, episode_index, episode)`` from a LongMemEval JSON file.
+
+    Each LongMemEval row is its own real conversation with its own diverse
+    question. ``seed`` is mirrored from the row index so the per-sample
+    print stays consistent with the synthetic path; uniqueness is enforced
+    by the index. The iterator stops once the file is exhausted, so the
+    runner will fail loudly if you ask for more samples than the file has
+    rather than silently repeat.
+    """
+
+    episodes = load_longmemeval_episodes(path)
+    if start_index < 0 or start_index >= len(episodes):
+        raise SystemExit(
+            f"--start-seed {start_index} out of range for LongMemEval file "
+            f"(loaded {len(episodes)} rows)"
+        )
+    for index in range(start_index, len(episodes)):
+        episode = episodes[index]
+        yield index, episode.metadata.get("longmemeval_question_id") or index, episode
 
 
 def _merge_counters(parts: list[AggregateCounterSnapshot]) -> AggregateCounterSnapshot:
@@ -161,15 +184,33 @@ def _evaluate_one(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a multi-episode FastMemoryWriteEnv evaluation.")
+    parser.add_argument(
+        "--dataset",
+        choices=["synthetic", "longmemeval"],
+        default="synthetic",
+        help="synthetic: use the project's templated generator (test fixture; "
+        "different seeds only swap entity names). longmemeval: use real "
+        "human-authored conversations from a LongMemEval JSON file - the "
+        "honest test for diverse questions.",
+    )
+    parser.add_argument(
+        "--longmemeval-path",
+        help="Path to a LongMemEval JSON file (required when --dataset=longmemeval).",
+    )
     parser.add_argument("--mode", choices=[m.value for m in SYNTHETIC_DATASET_MODES], default=DatasetMode.SMALL.value)
     parser.add_argument(
         "--samples",
         type=int,
         default=20,
         help="Number of distinct episodes to run. Each sample is one full streaming "
-        "episode; the runner never repeats a (seed, episode_index) pair.",
+        "episode; the runner never repeats a sample key.",
     )
-    parser.add_argument("--start-seed", type=int, default=7)
+    parser.add_argument(
+        "--start-seed",
+        type=int,
+        default=7,
+        help="Starting seed (synthetic) or starting row index (longmemeval).",
+    )
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--use-test-index", action="store_true")
     parser.add_argument("--output-dir", default="results/multi")
@@ -180,13 +221,18 @@ def main() -> None:
 
     if args.samples < 1:
         raise SystemExit("--samples must be >= 1")
+    if args.dataset == "longmemeval" and not args.longmemeval_path:
+        raise SystemExit("--longmemeval-path is required when --dataset=longmemeval")
 
     use_test_index = bool(args.use_test_index or args.mock)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     mode = DatasetMode(args.mode)
-    iterator = _episode_iter(mode, start_seed=args.start_seed)
+    if args.dataset == "longmemeval":
+        iterator = _longmemeval_episode_iter(args.longmemeval_path, start_index=args.start_seed)
+    else:
+        iterator = _synthetic_episode_iter(mode, start_seed=args.start_seed)
 
     per_episode_summaries: list[dict] = []
     all_query_metrics = []
