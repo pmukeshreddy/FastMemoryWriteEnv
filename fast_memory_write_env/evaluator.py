@@ -293,6 +293,7 @@ class StreamingEvaluator:
         policy: MemoryWritePolicy,
         work_dir: str | Path | None = None,
         run_config: RunConfig | dict[str, Any] | None = None,
+        answer_llm_client: LLMClient | None = None,
     ) -> StreamingEvaluator:
         base = Path(work_dir) if work_dir is not None else Path(tempfile.mkdtemp(prefix="fmwe-eval-"))
         memory_store = MemoryStore(base / "memory.sqlite")
@@ -303,6 +304,9 @@ class StreamingEvaluator:
                 vector_index=InMemoryIndex(),
                 memory_store=memory_store,
             ),
+            answer_llm_client=answer_llm_client
+            if answer_llm_client is not None
+            else getattr(policy, "llm_client", None),
         )
         config = _merge_run_config(run_config, {"backend_type": "in_memory_test"})
         return cls(env=env, policy=policy, run_config=config)
@@ -315,6 +319,7 @@ class StreamingEvaluator:
         work_dir: str | Path,
         run_config: RunConfig | dict[str, Any] | None = None,
         embedding_client: EmbeddingClient | None = None,
+        answer_llm_client: LLMClient | None = None,
     ) -> StreamingEvaluator:
         try:
             embedding_client = embedding_client or OpenAIEmbeddingClient.from_env()
@@ -337,6 +342,9 @@ class StreamingEvaluator:
                 vector_index=PineconeIndex(config, embedding_client=embedding_client),
                 memory_store=memory_store,
             ),
+            answer_llm_client=answer_llm_client
+            if answer_llm_client is not None
+            else getattr(policy, "llm_client", None),
         )
         run_config_payload = _merge_run_config(
             run_config,

@@ -25,8 +25,30 @@ from fast_memory_write_env.actions import (
     validate_environment_action,
 )
 from fast_memory_write_env.index import RetrievalIndex, SearchResult, estimate_tokens
+from fast_memory_write_env.llm_client import LLMClient, LLMClientError, LLMMessage
 from fast_memory_write_env.schemas import MemoryRecord, MemoryStatus, StreamingEpisode
 from fast_memory_write_env.stores import MemoryStore, RawEventStore
+
+
+_ANSWER_COMPOSE_SYSTEM_PROMPT = (
+    "You are a focused question-answering assistant for a streaming memory "
+    "system. You will be given a user question and a list of candidate memory "
+    "passages retrieved from the system's memory store. Each passage has a "
+    "memory_id and content.\n\n"
+    "Rules:\n"
+    "- Answer ONLY the question that was asked. Do not append unrelated facts.\n"
+    "- Use ONLY the memories that are directly relevant. Ignore the rest.\n"
+    "- If no provided memory is relevant, abstain with the exact text "
+    "\"I do not know from indexed memory.\"\n"
+    "- Keep the answer to one short, focused sentence (or two if multi-fact).\n"
+    "- Quote facts faithfully; do not invent details.\n\n"
+    "Reply in JSON only with this exact shape:\n"
+    "{\"answer\": str, \"cited_memory_ids\": [str]}\n"
+    "where cited_memory_ids lists exactly the memory_ids you actually used in "
+    "the answer (empty list when abstaining)."
+)
+_ANSWER_COMPOSE_MAX_PASSAGE_CHARS = 800
+_ANSWER_ABSTENTION_TEXT = "I do not know from indexed memory."
 
 
 BASE_LATENCY_MS = {
@@ -55,6 +77,7 @@ class FastMemoryWriteEnv:
         current_time_ms: int = 0,
         storage_budget_tokens_remaining: int | None = None,
         indexing_budget_operations_remaining: int | None = None,
+        answer_llm_client: LLMClient | None = None,
     ) -> None:
         self.raw_event_store = raw_event_store
         self.memory_store = memory_store
@@ -68,6 +91,11 @@ class FastMemoryWriteEnv:
         )
         self.ignored_event_ids: list[str] = []
         self.last_search_results: list[SearchResult] = []
+        # Optional LLM that composes the per-query answer from the retrieved
+        # memories. When ``None`` the env falls back to a deterministic
+        # top-1-memory answer that avoids the multi-memory-concat noise that
+        # the dumb concatenation path used to produce.
+        self.answer_llm_client: LLMClient | None = answer_llm_client
         self._lock = threading.RLock()
 
     def set_budgets(
@@ -530,18 +558,19 @@ class FastMemoryWriteEnv:
     def _answer(self, action: AnswerAction) -> ActionResult:
         memory_ids = action.retrieved_memory_ids or [result.memory_id for result in self.last_search_results]
         search_results_by_id = {result.memory_id: result for result in self.last_search_results}
-        answer_parts: list[str] = []
-        cited_memory_ids: list[str] = []
+        candidates: list[tuple[str, str]] = []
         for memory_id in memory_ids:
             result = search_results_by_id.get(memory_id)
             content = _retrieved_content(result)
             if content:
-                answer_parts.append(content)
-                cited_memory_ids.append(memory_id)
-        if answer_parts:
-            answer = " ".join(answer_parts)
+                candidates.append((memory_id, content))
+
+        if not candidates:
+            answer = _ANSWER_ABSTENTION_TEXT
+            cited_memory_ids: list[str] = []
         else:
-            answer = "I do not know from indexed memory."
+            answer, cited_memory_ids = self._compose_answer(action.query_text, candidates)
+
         return _success(
             "answer",
             token_count=estimate_tokens(action.query_text) + estimate_tokens(answer),
@@ -552,6 +581,45 @@ class FastMemoryWriteEnv:
                 "cited_memory_ids": cited_memory_ids,
             },
         )
+
+    def _compose_answer(
+        self,
+        query_text: str,
+        candidates: list[tuple[str, str]],
+    ) -> tuple[str, list[str]]:
+        """Compose a focused answer from retrieved memories.
+
+        Uses the configured ``answer_llm_client`` when available so the
+        candidate answer reflects only the relevant memories, and cites
+        exactly the memories used. Falls back to the top-1 retrieved
+        memory deterministically on any LLM failure.
+        """
+
+        if self.answer_llm_client is not None:
+            composed = _llm_compose_answer(
+                client=self.answer_llm_client,
+                query_text=query_text,
+                candidates=candidates,
+            )
+            if composed is not None:
+                answer, llm_cited = composed
+                allowed_ids = {memory_id for memory_id, _ in candidates}
+                cited = [mid for mid in llm_cited if mid in allowed_ids]
+                # Remove duplicate ids while keeping order.
+                seen: set[str] = set()
+                ordered_cited = [mid for mid in cited if not (mid in seen or seen.add(mid))]
+                if not ordered_cited and answer.strip() and answer.strip() != _ANSWER_ABSTENTION_TEXT:
+                    # Defensive: a non-abstention answer with no citations is
+                    # almost always the LLM hallucinating. Fall back to top-1
+                    # so evidence_correct stays honest.
+                    return self._top1_answer(candidates)
+                return answer.strip(), ordered_cited
+        return self._top1_answer(candidates)
+
+    @staticmethod
+    def _top1_answer(candidates: list[tuple[str, str]]) -> tuple[str, list[str]]:
+        memory_id, content = candidates[0]
+        return content, [memory_id]
 
     def _index_memory(self, memory_id: str, *, available_at_ms: float) -> MemoryRecord:
         memory = self.memory_store.require(memory_id)
@@ -686,3 +754,83 @@ def _retrieved_content(result: SearchResult | None) -> str | None:
     if result.memory is not None:
         return result.memory.content
     return result.content or None
+
+
+def _llm_compose_answer(
+    *,
+    client: LLMClient,
+    query_text: str,
+    candidates: list[tuple[str, str]],
+) -> tuple[str, list[str]] | None:
+    """Ask the LLM to write a focused answer + cite only the memories it used.
+
+    Returns ``(answer, cited_memory_ids)`` on success, ``None`` if the client
+    errors, refuses, or returns a malformed payload. The caller treats
+    ``None`` as "fall back to top-1" so a flaky LLM cannot silently degrade
+    or invent citations.
+    """
+
+    import json
+
+    user_payload: dict[str, object] = {
+        "question": query_text,
+        "candidate_memories": [
+            {
+                "memory_id": memory_id,
+                "content": content[:_ANSWER_COMPOSE_MAX_PASSAGE_CHARS],
+            }
+            for memory_id, content in candidates
+        ],
+    }
+    messages = [
+        LLMMessage(role="system", content=_ANSWER_COMPOSE_SYSTEM_PROMPT),
+        LLMMessage(role="user", content=json.dumps(user_payload, sort_keys=True)),
+    ]
+    try:
+        response = client.complete(
+            messages,
+            temperature=0.0,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "compose_answer",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "answer": {"type": "string"},
+                            "cited_memory_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["answer", "cited_memory_ids"],
+                    },
+                },
+            },
+        )
+    except LLMClientError:
+        return None
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+    payload: object = response.parsed_json
+    if payload is None:
+        try:
+            payload = json.loads(response.content or "")
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+    answer = payload.get("answer")
+    cited_raw = payload.get("cited_memory_ids", [])
+    if not isinstance(answer, str):
+        return None
+    if not isinstance(cited_raw, list):
+        return None
+    cited: list[str] = []
+    for value in cited_raw:
+        if isinstance(value, str):
+            cited.append(value)
+    return answer, cited
