@@ -30,6 +30,7 @@ from fast_memory_write_env.evaluator import (
     build_failure_diagnostics,
     write_evaluation_outputs,
 )
+from fast_memory_write_env.hybrid_index import HybridRetrievalIndex
 from fast_memory_write_env.in_memory_index import InMemoryIndex
 from fast_memory_write_env.index import estimate_tokens
 from fast_memory_write_env.schemas import (
@@ -51,6 +52,20 @@ def _build_env(tmp_path: Path) -> FastMemoryWriteEnv:
         raw_event_store=RawEventStore(tmp_path / "raw.sqlite"),
         memory_store=MemoryStore(tmp_path / "memory.sqlite"),
         retrieval_index=InMemoryIndex(),
+    )
+
+
+def _build_hybrid_env(tmp_path: Path) -> FastMemoryWriteEnv:
+    """Env wired with the production-shaped HybridRetrievalIndex."""
+
+    memory_store = MemoryStore(tmp_path / "memory.sqlite")
+    return FastMemoryWriteEnv(
+        raw_event_store=RawEventStore(tmp_path / "raw.sqlite"),
+        memory_store=memory_store,
+        retrieval_index=HybridRetrievalIndex(
+            vector_index=InMemoryIndex(),
+            memory_store=memory_store,
+        ),
     )
 
 
@@ -346,6 +361,28 @@ def test_ben_delayed_index_leaves_query_unanswerable(tmp_path) -> None:
     assert failure["first_missing_stage"] in {"indexed", "retrieved"}
     assert failure["stage_status"]["raw_written"] is True
     assert failure["stage_status"]["memory_written"] is True
+
+
+def test_ben_delayed_index_recovered_by_hybrid_retrieval(tmp_path) -> None:
+    """Same Ben policy that fails with vector-only retrieval should answer
+    correctly when the env is wired with HybridRetrievalIndex, because the
+    lexical FTS5 mirror serves the new memories without needing any of the
+    indexing budget the policy never had."""
+
+    evaluator = StreamingEvaluator(
+        env=_build_hybrid_env(tmp_path),
+        policy=_BenDelayedIndexPolicy(),
+        storage_budget_tokens_remaining=1000,
+        indexing_budget_operations_remaining=0,
+    )
+
+    result = evaluator.evaluate_episode(_episode_for_ben_or_dee())
+
+    metric = result.query_metrics[0]
+    assert metric.retrieved_memory_ids != [], "hybrid should serve the memory lexically"
+    assert metric.cited_memory_ids != []
+    # Both required facts should now be covered by the cited memories.
+    assert set(metric.required_fact_ids).issubset(set(metric.covered_fact_ids))
 
 
 def test_dee_compression_makes_query_answerable_under_tight_budget(tmp_path) -> None:

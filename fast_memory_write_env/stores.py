@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -10,6 +11,18 @@ from typing import Any
 
 from fast_memory_write_env.index import estimate_tokens
 from fast_memory_write_env.schemas import MemoryRecord, MemoryStatus, RawEvent
+
+
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def _build_fts_query(query: str) -> str:
+    """Translate a free-text query into a safe FTS5 OR-of-phrases expression."""
+
+    tokens = _FTS_TOKEN_RE.findall(query)
+    if not tokens:
+        return ""
+    return " OR ".join(f'"{token}"' for token in tokens)
 
 
 class RawEventStore:
@@ -231,13 +244,24 @@ class MemoryStore:
             self.upsert(updated)
             return updated
 
-    def set_indexed(self, memory_id: str, indexed: bool, updated_at_ms: int) -> MemoryRecord:
+    def set_indexed(
+        self,
+        memory_id: str,
+        indexed: bool,
+        updated_at_ms: int,
+        *,
+        metadata_updates: dict[str, Any] | None = None,
+    ) -> MemoryRecord:
         with self._lock:
             existing = self.require(memory_id)
+            merged_metadata = dict(existing.metadata)
+            if metadata_updates:
+                merged_metadata.update(metadata_updates)
             updated = existing.model_copy(
                 update={
                     "indexed": indexed,
                     "updated_at_ms": max(updated_at_ms, existing.updated_at_ms),
+                    "metadata": merged_metadata,
                 }
             )
             self.upsert(updated)
@@ -265,6 +289,57 @@ class MemoryStore:
             self.upsert(updated)
             return updated
 
+    def lexical_search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        as_of_ms: float | None = None,
+    ) -> list[tuple[MemoryRecord, float]]:
+        """Return ``(memory, bm25_score)`` ordered by FTS5 relevance.
+
+        Only ``ACTIVE`` memories are considered. When ``as_of_ms`` is provided,
+        memories whose ``metadata.lexical_available_at_ms`` (or, falling back,
+        ``updated_at_ms``) exceeds the cutoff are excluded so historical
+        snapshots stay consistent with vector-side ``available_at_ms`` filters.
+        """
+
+        fts_query = _build_fts_query(query)
+        if not fts_query:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT m.payload_json, bm25(memories_fts) AS score
+                FROM memories_fts
+                JOIN memories m ON m.memory_id = memories_fts.memory_id
+                WHERE memories_fts MATCH ?
+                  AND m.status = ?
+                ORDER BY score
+                LIMIT ?
+                """,
+                (fts_query, MemoryStatus.ACTIVE.value, max(top_k * 4, top_k)),
+            ).fetchall()
+        results: list[tuple[MemoryRecord, float]] = []
+        for row in rows:
+            memory = MemoryRecord.model_validate_json(row["payload_json"])
+            if as_of_ms is not None:
+                lexical_available = memory.metadata.get("lexical_available_at_ms")
+                cutoff = (
+                    float(lexical_available)
+                    if lexical_available is not None
+                    else float(memory.updated_at_ms)
+                )
+                if cutoff > as_of_ms:
+                    continue
+            raw_score = float(row["score"]) if row["score"] is not None else 0.0
+            # FTS5 bm25 returns more-negative for better matches; flip the sign
+            # so callers see a non-negative, higher-is-better score.
+            results.append((memory, max(0.0, -raw_score)))
+            if len(results) >= top_k:
+                break
+        return results
+
     def _insert_or_replace(self, memory: MemoryRecord, *, replace: bool) -> None:
         statement = "INSERT OR REPLACE" if replace else "INSERT"
         self._conn.execute(
@@ -285,6 +360,14 @@ class MemoryStore:
                 memory.updated_at_ms,
                 memory.model_dump_json(),
             ),
+        )
+        # Keep the FTS5 mirror in sync with the canonical record. Re-insert on
+        # both create and update; status/availability filtering happens at
+        # query time so we only need the latest content here.
+        self._conn.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory.memory_id,))
+        self._conn.execute(
+            "INSERT INTO memories_fts (memory_id, content) VALUES (?, ?)",
+            (memory.memory_id, memory.content),
         )
 
     def _init_schema(self) -> None:
@@ -309,6 +392,15 @@ class MemoryStore:
                 )
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories (entity_id)"
+                )
+                # FTS5 mirror of memory.content for the lexical retrieval path.
+                # Pinecone (or InMemoryIndex) still owns the semantic vectors;
+                # this mirror is what HybridRetrievalIndex queries for the
+                # BM25 side of fusion. ``memory_id`` stays UNINDEXED so it is
+                # fetched as a column but not tokenized.
+                self._conn.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5("
+                    "memory_id UNINDEXED, content, tokenize='porter unicode61')"
                 )
 
 

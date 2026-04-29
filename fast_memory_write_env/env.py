@@ -209,6 +209,11 @@ class FastMemoryWriteEnv:
         tokens = estimate_tokens(action.content)
         self._require_storage_budget(tokens)
         self._require_indexing_budget(1 if action.index_immediately else 0)
+        lexical_available_at_ms = _available_at_ms(
+            self.current_time_ms,
+            "write_memory",
+            token_count=tokens,
+        )
         memory = MemoryRecord(
             memory_id=action.memory_id,
             entity_id=action.entity_id,
@@ -218,7 +223,12 @@ class FastMemoryWriteEnv:
             created_at_ms=self.current_time_ms,
             updated_at_ms=self.current_time_ms,
             estimated_tokens=tokens,
-            metadata={"importance": action.importance, **action.metadata},
+            metadata={
+                "importance": action.importance,
+                "lexical_available_at_ms": lexical_available_at_ms,
+                "needs_reindex": False,
+                **action.metadata,
+            },
         )
         delta = self.memory_store.create(memory)
         indexed = False
@@ -228,13 +238,10 @@ class FastMemoryWriteEnv:
                 memory.memory_id,
                 True,
                 self.current_time_ms,
+                metadata_updates={"needs_reindex": False},
             )
             indexed = True
-            available_at_ms = _available_at_ms(
-                self.current_time_ms,
-                "write_memory",
-                token_count=tokens,
-            )
+            available_at_ms = lexical_available_at_ms
             self.retrieval_index.upsert(_memory_available_at(memory, available_at_ms))
         self._consume_storage_budget(delta)
         self._consume_indexing_budget(1 if indexed else 0)
@@ -245,44 +252,89 @@ class FastMemoryWriteEnv:
             payload={
                 "memory_id": memory.memory_id,
                 "indexed": indexed,
+                "lexical_available_at_ms": lexical_available_at_ms,
                 "available_at_ms": available_at_ms,
             },
         )
 
     def _update_memory(self, action: UpdateMemoryAction) -> ActionResult:
+        """Apply a content update without auto-spending the indexing budget.
+
+        Semantics:
+
+        * ``index_immediately=True`` re-upserts the vector and costs 1 indexing op.
+        * ``index_immediately=False`` on a previously indexed memory drops the
+          stale vector and marks ``needs_reindex=True`` instead of silently
+          burning budget. The LLM sees ``needs_reindex`` on ``active_memories``
+          and can call ``index_now`` later when budget allows.
+        * The lexical (BM25) mirror is refreshed on every update so the
+          memory remains hybrid-queryable with the new content immediately.
+        """
+
         self._validate_source_event_ids(action.source_event_ids)
         previous = self.memory_store.require(action.memory_id)
         projected_delta = estimate_tokens(action.content) - previous.estimated_tokens
-        should_index = action.index_immediately or previous.indexed
+        will_index_now = action.index_immediately
         self._require_storage_budget(projected_delta)
-        self._require_indexing_budget(1 if should_index else 0)
+        self._require_indexing_budget(1 if will_index_now else 0)
+
         token_count = estimate_tokens(action.content)
+        new_lexical_available_at_ms = _available_at_ms(
+            self.current_time_ms,
+            "update_memory",
+            token_count=token_count,
+        )
+        needs_reindex_after = previous.indexed and not will_index_now
+        metadata_updates: dict[str, object] = {
+            "last_update_reason": action.reason,
+            "lexical_available_at_ms": new_lexical_available_at_ms,
+            "needs_reindex": needs_reindex_after,
+            **action.metadata,
+        }
         updated, delta = self.memory_store.update_memory(
             memory_id=action.memory_id,
             content=action.content,
             source_event_ids=action.source_event_ids,
             fact_ids=action.fact_ids,
             updated_at_ms=self.current_time_ms,
-            metadata={"last_update_reason": action.reason, **action.metadata},
+            metadata=metadata_updates,
         )
-        available_at_ms = None
-        if should_index:
-            updated = self.memory_store.set_indexed(action.memory_id, True, self.current_time_ms)
-            available_at_ms = _available_at_ms(
+        available_at_ms: float | None = None
+        if will_index_now:
+            updated = self.memory_store.set_indexed(
+                action.memory_id,
+                True,
                 self.current_time_ms,
-                "update_memory",
-                token_count=token_count,
+                metadata_updates={"needs_reindex": False},
             )
+            available_at_ms = new_lexical_available_at_ms
             self.retrieval_index.upsert(_memory_available_at(updated, available_at_ms))
+        elif previous.indexed:
+            # Drop the stale vector. Lexical search continues to serve the
+            # current content via the FTS5 mirror; a future index_now (which
+            # the LLM can see is required because needs_reindex=True is on
+            # the memory) restores semantic retrieval.
+            self.memory_store.set_indexed(
+                action.memory_id,
+                False,
+                self.current_time_ms,
+            )
+            self.retrieval_index.delete(
+                action.memory_id,
+                available_at_ms=_available_at_ms(self.current_time_ms, "update_memory"),
+            )
+
         self._consume_storage_budget(delta)
-        self._consume_indexing_budget(1 if should_index else 0)
+        self._consume_indexing_budget(1 if will_index_now else 0)
         return _success(
             "update_memory",
             token_count=token_count,
             storage_tokens_delta=delta,
             payload={
                 "memory_id": action.memory_id,
-                "indexed": should_index,
+                "indexed": will_index_now,
+                "needs_reindex": needs_reindex_after,
+                "lexical_available_at_ms": new_lexical_available_at_ms,
                 "available_at_ms": available_at_ms,
             },
         )
@@ -333,6 +385,11 @@ class FastMemoryWriteEnv:
             [fact_id for memory in source_memories for fact_id in memory.fact_ids],
             action.fact_ids,
         )
+        compressed_lexical_available_at_ms = _available_at_ms(
+            self.current_time_ms,
+            "compress_memory",
+            token_count=estimate_tokens(action.compressed_content),
+        )
         target = MemoryRecord(
             memory_id=action.target_memory_id,
             entity_id=source_memories[0].entity_id,
@@ -342,7 +399,12 @@ class FastMemoryWriteEnv:
             created_at_ms=target_existing.created_at_ms if target_existing else self.current_time_ms,
             updated_at_ms=self.current_time_ms,
             estimated_tokens=estimate_tokens(action.compressed_content),
-            metadata={"compressed_from": action.source_memory_ids, **action.metadata},
+            metadata={
+                "compressed_from": action.source_memory_ids,
+                "lexical_available_at_ms": compressed_lexical_available_at_ms,
+                "needs_reindex": False,
+                **action.metadata,
+            },
         )
         previous_target_tokens = target_existing.estimated_tokens if target_existing else 0
         self._require_storage_budget(target.estimated_tokens - previous_target_tokens)
@@ -496,7 +558,12 @@ class FastMemoryWriteEnv:
         if memory.status != MemoryStatus.ACTIVE:
             raise ValueError(f"cannot index non-active memory: {memory_id}")
         self._validate_source_event_ids(memory.source_event_ids)
-        indexed_memory = self.memory_store.set_indexed(memory_id, True, self.current_time_ms)
+        indexed_memory = self.memory_store.set_indexed(
+            memory_id,
+            True,
+            self.current_time_ms,
+            metadata_updates={"needs_reindex": False},
+        )
         visible_memory = _memory_available_at(indexed_memory, available_at_ms)
         self.retrieval_index.upsert(visible_memory)
         return visible_memory

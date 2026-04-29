@@ -25,6 +25,7 @@ from fast_memory_write_env.embeddings import (
     OpenAIEmbeddingClient,
 )
 from fast_memory_write_env.env import FastMemoryWriteEnv
+from fast_memory_write_env.hybrid_index import HybridRetrievalIndex
 from fast_memory_write_env.in_memory_index import InMemoryIndex
 from fast_memory_write_env.llm_client import LLMClient
 from fast_memory_write_env.metrics import (
@@ -294,10 +295,14 @@ class StreamingEvaluator:
         run_config: RunConfig | dict[str, Any] | None = None,
     ) -> StreamingEvaluator:
         base = Path(work_dir) if work_dir is not None else Path(tempfile.mkdtemp(prefix="fmwe-eval-"))
+        memory_store = MemoryStore(base / "memory.sqlite")
         env = FastMemoryWriteEnv(
             raw_event_store=RawEventStore(base / "raw.sqlite"),
-            memory_store=MemoryStore(base / "memory.sqlite"),
-            retrieval_index=InMemoryIndex(),
+            memory_store=memory_store,
+            retrieval_index=HybridRetrievalIndex(
+                vector_index=InMemoryIndex(),
+                memory_store=memory_store,
+            ),
         )
         config = _merge_run_config(run_config, {"backend_type": "in_memory_test"})
         return cls(env=env, policy=policy, run_config=config)
@@ -324,10 +329,14 @@ class StreamingEvaluator:
             dimension=embedding_client.dimension,
         )
         assert config is not None
+        memory_store = MemoryStore(Path(work_dir) / "memory.sqlite")
         env = FastMemoryWriteEnv(
             raw_event_store=RawEventStore(Path(work_dir) / "raw.sqlite"),
-            memory_store=MemoryStore(Path(work_dir) / "memory.sqlite"),
-            retrieval_index=PineconeIndex(config, embedding_client=embedding_client),
+            memory_store=memory_store,
+            retrieval_index=HybridRetrievalIndex(
+                vector_index=PineconeIndex(config, embedding_client=embedding_client),
+                memory_store=memory_store,
+            ),
         )
         run_config_payload = _merge_run_config(
             run_config,
