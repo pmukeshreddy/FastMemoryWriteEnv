@@ -93,6 +93,21 @@ class PineconeIndex:
         # current-state operation.
         self._index.delete(ids=[memory_id], namespace=self.config.namespace)
 
+    def cleanup_namespace(self) -> None:
+        """Delete every vector in the configured namespace.
+
+        Used between samples so each independent run starts from an empty
+        retrieval space, with no cross-talk from earlier samples sharing the
+        same physical Pinecone index.
+        """
+
+        try:
+            self._index.delete(delete_all=True, namespace=self.config.namespace)
+        except Exception:  # pragma: no cover - best-effort cleanup
+            # Some Pinecone responses raise when the namespace is already
+            # empty. Swallow only here so a per-sample teardown is robust.
+            pass
+
     def search(
         self,
         query: str,

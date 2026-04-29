@@ -14,6 +14,7 @@ combined aggregate is written at ``<output_dir>/aggregate_summary.json``.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
@@ -196,19 +197,41 @@ def _evaluate_one(
         },
     )
     episode_output = output_dir / f"sample_{sample_slot:02d}"
+    show_inner = args.concurrent_samples == 1
+    namespace = f"fmwe-multi-sample-{sample_slot:04d}"
     with tempfile.TemporaryDirectory(prefix="fmwe-eval-") as tmpdir:
-        evaluator = (
-            StreamingEvaluator.with_local_test_index(policy=policy, work_dir=tmpdir, run_config=run_config)
-            if use_test_index
-            else StreamingEvaluator.with_pinecone(policy=policy, work_dir=tmpdir, run_config=run_config)
-        )
+        if use_test_index:
+            evaluator = StreamingEvaluator.with_local_test_index(
+                policy=policy, work_dir=tmpdir, run_config=run_config
+            )
+        else:
+            evaluator = StreamingEvaluator.with_pinecone(
+                policy=policy,
+                work_dir=tmpdir,
+                run_config=run_config,
+                namespace=namespace,
+            )
         evaluator.latency_budget_ms = args.latency_budget_ms
         evaluator.storage_budget_tokens_remaining = args.storage_budget
         evaluator.indexing_budget_operations_remaining = args.indexing_budget
         evaluator.queue_drain_timeout_seconds = args.queue_drain_timeout_seconds
         evaluator.worker_stop_timeout_seconds = args.worker_stop_timeout_seconds
-        result = evaluator.evaluate_episode(episode)
-        result = write_evaluation_outputs(result, episode_output)
+        evaluator.show_inner_progress = show_inner
+        try:
+            result = evaluator.evaluate_episode(episode)
+            result = write_evaluation_outputs(result, episode_output)
+        finally:
+            # Clean up the per-sample namespace so concurrent samples never
+            # see each other's vectors and a sequential run does not pile
+            # up state in Pinecone between iterations.
+            cleanup = getattr(evaluator.env.retrieval_index, "vector_index", None)
+            cleanup_target = cleanup if cleanup is not None else evaluator.env.retrieval_index
+            cleanup_fn = getattr(cleanup_target, "cleanup_namespace", None)
+            if callable(cleanup_fn):
+                try:
+                    cleanup_fn()
+                except Exception:
+                    pass
     return result
 
 
@@ -271,10 +294,21 @@ def main() -> None:
         "OpenAI cost bounded on LongMemEval (~50-100 events is enough for "
         "a fast 20-sample sanity test; 0 means use the full episode).",
     )
+    parser.add_argument(
+        "--concurrent-samples",
+        type=int,
+        default=4,
+        help="Number of samples to run in parallel via a thread pool. "
+        "Samples are independent (own env, own SQLite tmpdir, own Pinecone "
+        "namespace) so this is real parallelism, bounded by your OpenAI "
+        "RPM/TPM. Set to 1 to disable parallelism.",
+    )
     args = parser.parse_args()
 
     if args.samples < 1:
         raise SystemExit("--samples must be >= 1")
+    if args.concurrent_samples < 1:
+        raise SystemExit("--concurrent-samples must be >= 1")
     if args.dataset == "longmemeval" and not args.longmemeval_path:
         raise SystemExit("--longmemeval-path is required when --dataset=longmemeval")
 
@@ -295,14 +329,9 @@ def main() -> None:
     total_queries = 0
     seen_keys: set[tuple[int, int | None]] = set()
 
-    samples_bar = tqdm(
-        total=args.samples,
-        desc="samples",
-        unit="sample",
-        leave=True,
-        dynamic_ncols=True,
-        position=0,
-    )
+    # Materialize the sample plan up front so seed/index pairs stay
+    # deterministic regardless of completion order under concurrency.
+    plan: list[tuple[int, Any, StreamingEpisode, int]] = []
     for sample_slot in range(args.samples):
         seed, episode_index, episode = next(iterator)
         key = (seed, episode_index)
@@ -315,6 +344,19 @@ def main() -> None:
             episode = _truncate_episode_events(
                 episode, max_events=args.max_events_per_sample
             )
+        plan.append((seed, episode_index, episode, sample_slot))
+
+    samples_bar = tqdm(
+        total=args.samples,
+        desc="samples",
+        unit="sample",
+        leave=True,
+        dynamic_ncols=True,
+        position=0,
+    )
+
+    def _run_one(plan_entry):
+        seed, episode_index, episode, sample_slot = plan_entry
         result = _evaluate_one(
             episode=episode,
             use_test_index=use_test_index,
@@ -322,6 +364,21 @@ def main() -> None:
             sample_slot=sample_slot,
             args=args,
         )
+        return seed, episode_index, sample_slot, result
+
+    if args.concurrent_samples == 1:
+        completed = (_run_one(entry) for entry in plan)
+    else:
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=args.concurrent_samples,
+            thread_name_prefix="fmwe-sample",
+        )
+        futures = [executor.submit(_run_one, entry) for entry in plan]
+        completed = (f.result() for f in concurrent.futures.as_completed(futures))
+
+    completion_index = 0
+    for seed, episode_index, sample_slot, result in completed:
+        completion_index += 1
         ep_queries = len(result.query_metrics)
         total_queries += ep_queries
         all_query_metrics.extend(result.query_metrics)
@@ -347,21 +404,23 @@ def main() -> None:
             }
         )
         samples_bar.set_postfix(
+            slot=sample_slot,
             seed=seed,
             idx=episode_index,
-            ep=result.episode_id,
             score=f"{result.score_breakdown.score:.2f}",
             success=f"{result.aggregate_metrics.answer_success:.2f}",
         )
         samples_bar.update(1)
         tqdm.write(
-            f"[{sample_slot + 1:02d}/{args.samples:02d}] "
+            f"[{completion_index:02d}/{args.samples:02d}] slot={sample_slot:02d} "
             f"seed={seed} idx={episode_index} episode={result.episode_id} "
             f"queries={ep_queries} score={result.score_breakdown.score:.3f} "
             f"answer_success={result.aggregate_metrics.answer_success:.3f}"
         )
 
     samples_bar.close()
+    if args.concurrent_samples > 1:
+        executor.shutdown(wait=True)
     episodes_run = args.samples
 
     merged_counters = _merge_counters(all_counters)

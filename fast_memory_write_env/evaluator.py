@@ -274,6 +274,7 @@ class StreamingEvaluator:
         answer_llm_client: LLMClient | None = None,
         queue_drain_timeout_seconds: float = 1800.0,
         worker_stop_timeout_seconds: float = 1800.0,
+        show_inner_progress: bool = True,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -290,6 +291,10 @@ class StreamingEvaluator:
             raise ValueError("evaluator timeouts must be positive")
         self.queue_drain_timeout_seconds = queue_drain_timeout_seconds
         self.worker_stop_timeout_seconds = worker_stop_timeout_seconds
+        # When samples run concurrently, multiple inner bars at once corrupt
+        # the terminal. The runner sets this to False and only the outer
+        # samples bar updates.
+        self.show_inner_progress = show_inner_progress
         # Default the answer-correctness judge to the policy's LLM client when
         # one is available (LLMMemoryWritePolicy exposes ``llm_client``).
         # Baselines and rule-based test policies have no client, so scoring
@@ -345,6 +350,7 @@ class StreamingEvaluator:
         run_config: RunConfig | dict[str, Any] | None = None,
         embedding_client: EmbeddingClient | None = None,
         answer_llm_client: LLMClient | None = None,
+        namespace: str | None = None,
     ) -> StreamingEvaluator:
         try:
             embedding_client = embedding_client or OpenAIEmbeddingClient.from_env()
@@ -354,10 +360,13 @@ class StreamingEvaluator:
                 "set OPENAI_API_KEY (and optionally OPENAI_EMBEDDING_MODEL/"
                 "OPENAI_EMBEDDING_DIMENSION), or pass embedding_client explicitly."
             ) from exc
-        config = load_pinecone_config(
-            required=True,
-            dimension=embedding_client.dimension,
-        )
+        load_kwargs: dict[str, Any] = {
+            "required": True,
+            "dimension": embedding_client.dimension,
+        }
+        if namespace is not None:
+            load_kwargs["namespace"] = namespace
+        config = load_pinecone_config(**load_kwargs)
         assert config is not None
         memory_store = MemoryStore(Path(work_dir) / "memory.sqlite")
         env = FastMemoryWriteEnv(
@@ -443,6 +452,7 @@ class StreamingEvaluator:
             unit="item",
             leave=True,
             dynamic_ncols=True,
+            disable=not self.show_inner_progress,
         )
         events_processed = 0
         queries_processed = 0
