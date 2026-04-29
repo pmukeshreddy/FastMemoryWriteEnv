@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from tqdm.auto import tqdm
+
+
+def _debug_log(message: str) -> None:
+    """Thread-safe debug print that plays nicely with tqdm progress bars."""
+
+    tqdm.write(f"[debug {threading.current_thread().name} t={time.strftime('%H:%M:%S')}] {message}")
 
 from pydantic import Field
 
@@ -91,6 +99,7 @@ class _AsyncMemoryWriteWorker:
         counters: AggregateCounterSnapshot,
         indexed_memory_available_at_ms: dict[str, float],
         state_lock: threading.RLock,
+        debug_timing: bool = False,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -106,6 +115,7 @@ class _AsyncMemoryWriteWorker:
         self.indexed_memory_available_at_ms = indexed_memory_available_at_ms
         self.state_lock = state_lock
         self.logical_time_ms = 0.0
+        self.debug_timing = debug_timing
         self._error: BaseException | None = None
         self._thread = threading.Thread(
             target=self._run,
@@ -167,6 +177,7 @@ class _AsyncMemoryWriteWorker:
         budget_snapshot = self.env.budget_snapshot()
         active_memories = self.env.memory_store.list_active()
         active_memory_ids = [memory.memory_id for memory in active_memories]
+        decide_started = time.monotonic()
         try:
             proposals = self.policy.decide(
                 new_event=queue_item.event,
@@ -202,6 +213,8 @@ class _AsyncMemoryWriteWorker:
                     )
                 )
             actions = []
+        decide_elapsed = time.monotonic() - decide_started
+        actions_started = time.monotonic()
         for action in actions:
             result = self.env.execute_action_at(action, current_time_ms=int(self.logical_time_ms))
             self.logical_time_ms += result.latency_ms
@@ -238,6 +251,17 @@ class _AsyncMemoryWriteWorker:
                     and queue_item.event.facts
                 ):
                     self.counters.ignored_useful_event_count += 1
+        actions_elapsed = time.monotonic() - actions_started
+        if self.debug_timing:
+            action_types = ",".join(action.action_type for action in actions) or "<none>"
+            queue_depth = len(self.queue.pending_event_ids())
+            content_preview = (queue_item.event.content or "")[:60].replace("\n", " ")
+            _debug_log(
+                f"event={queue_item.event.event_id} "
+                f"decide={decide_elapsed:.2f}s actions={actions_elapsed:.2f}s "
+                f"actions=[{action_types}] active={len(active_memories)} "
+                f"queue={queue_depth} preview={content_preview!r}"
+            )
 
         with self.state_lock:
             self.recent_events.append(queue_item.event)
@@ -275,6 +299,7 @@ class StreamingEvaluator:
         queue_drain_timeout_seconds: float = 1800.0,
         worker_stop_timeout_seconds: float = 1800.0,
         show_inner_progress: bool = True,
+        debug_timing: bool = False,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -295,6 +320,7 @@ class StreamingEvaluator:
         # the terminal. The runner sets this to False and only the outer
         # samples bar updates.
         self.show_inner_progress = show_inner_progress
+        self.debug_timing = debug_timing or os.environ.get("FMWE_DEBUG_TIMING") == "1"
         # Default the answer-correctness judge to the policy's LLM client when
         # one is available (LLMMemoryWritePolicy exposes ``llm_client``).
         # Baselines and rule-based test policies have no client, so scoring
@@ -433,6 +459,7 @@ class StreamingEvaluator:
             counters=counters,
             indexed_memory_available_at_ms=indexed_memory_available_at_ms,
             state_lock=state_lock,
+            debug_timing=self.debug_timing,
         )
         records.append(
             RolloutRecord(
@@ -533,6 +560,7 @@ class StreamingEvaluator:
                         )
                 else:
                     query = item.query
+                    drain_started = time.monotonic()
                     if not memory_write_queue.wait_until_no_ready_work(
                         cutoff_enqueued_at_ms=query.timestamp_ms,
                         timeout_seconds=self.queue_drain_timeout_seconds,
@@ -542,6 +570,8 @@ class StreamingEvaluator:
                             f"(timeout={self.queue_drain_timeout_seconds}s; "
                             "raise --queue-drain-timeout-seconds for long LongMemEval rows)"
                         )
+                    drain_elapsed = time.monotonic() - drain_started
+                    search_started = time.monotonic()
                     search_result = self.env.execute_action_at(
                         SearchMemoryAction(
                             query_id=query.query_id,
@@ -551,6 +581,7 @@ class StreamingEvaluator:
                         ),
                         current_time_ms=query.timestamp_ms,
                     )
+                    search_elapsed = time.monotonic() - search_started
                     logical_time_ms += search_result.latency_ms
                     with state_lock:
                         records.append(_action_record(episode.episode_id, query.timestamp_ms, logical_time_ms, search_result))
@@ -569,6 +600,7 @@ class StreamingEvaluator:
                                 if fact_id in fact_lifecycles:
                                     fact_lifecycles[fact_id].retrieved_at_ms = logical_time_ms
 
+                    answer_started = time.monotonic()
                     answer_result = self.env.execute_action_at(
                         AnswerAction(
                             query_id=query.query_id,
@@ -577,6 +609,7 @@ class StreamingEvaluator:
                         ),
                         current_time_ms=int(logical_time_ms),
                     )
+                    answer_elapsed = time.monotonic() - answer_started
                     logical_time_ms += answer_result.latency_ms
                     with state_lock:
                         records.append(_action_record(episode.episode_id, query.timestamp_ms, logical_time_ms, answer_result))
@@ -591,6 +624,7 @@ class StreamingEvaluator:
                         cited_memory_ids,
                         search_results=self.env.last_search_results,
                     )
+                    judge_started = time.monotonic()
                     with state_lock:
                         try:
                             metric = evaluate_query_result(
@@ -652,6 +686,14 @@ class StreamingEvaluator:
                     events_processed += 1
                 else:
                     queries_processed += 1
+                    judge_elapsed = time.monotonic() - judge_started
+                    if self.debug_timing:
+                        _debug_log(
+                            f"query={query.query_id} drain={drain_elapsed:.2f}s "
+                            f"search={search_elapsed:.2f}s answer(compose)={answer_elapsed:.2f}s "
+                            f"judge={judge_elapsed:.2f}s retrieved={len(retrieved_memory_ids)} "
+                            f"cited={len(cited_memory_ids)}"
+                        )
                 progress_bar.update(1)
                 progress_bar.set_postfix(
                     phase="idle" if (events_processed + queries_processed) == len(episode.stream) else "advancing",

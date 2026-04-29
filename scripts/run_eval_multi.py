@@ -217,6 +217,7 @@ def _evaluate_one(
         evaluator.queue_drain_timeout_seconds = args.queue_drain_timeout_seconds
         evaluator.worker_stop_timeout_seconds = args.worker_stop_timeout_seconds
         evaluator.show_inner_progress = show_inner
+        evaluator.debug_timing = args.debug_timing
         try:
             result = evaluator.evaluate_episode(episode)
             result = write_evaluation_outputs(result, episode_output)
@@ -302,6 +303,12 @@ def main() -> None:
         "Samples are independent (own env, own SQLite tmpdir, own Pinecone "
         "namespace) so this is real parallelism, bounded by your OpenAI "
         "RPM/TPM. Set to 1 to disable parallelism.",
+    )
+    parser.add_argument(
+        "--debug-timing",
+        action="store_true",
+        help="Print per-event and per-query wall-clock timings (decide / "
+        "compose / judge) to surface which step is the bottleneck.",
     )
     args = parser.parse_args()
 
