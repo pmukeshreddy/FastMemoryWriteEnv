@@ -565,11 +565,50 @@ class FastMemoryWriteEnv:
             if content:
                 candidates.append((memory_id, content))
 
+        # Retrieval miss: nothing to compose from. Abstention is the only
+        # honest answer here, and it does not require an LLM call.
         if not candidates:
-            answer = _ANSWER_ABSTENTION_TEXT
-            cited_memory_ids: list[str] = []
-        else:
-            answer, cited_memory_ids = self._compose_answer(action.query_text, candidates)
+            return _success(
+                "answer",
+                token_count=estimate_tokens(action.query_text) + estimate_tokens(_ANSWER_ABSTENTION_TEXT),
+                count=0,
+                payload={
+                    "query_id": action.query_id,
+                    "answer": _ANSWER_ABSTENTION_TEXT,
+                    "cited_memory_ids": [],
+                },
+            )
+
+        # Production-shape: the LLM is the single composer. No silent
+        # fallback. If no client is wired, the action fails loudly so the
+        # caller fixes its configuration.
+        if self.answer_llm_client is None:
+            return ActionExecutionResult(
+                success=False,
+                action_type="answer",
+                latency_ms=_latency_ms("answer"),
+                storage_tokens_delta=0,
+                error=(
+                    "answer requires answer_llm_client; configure FastMemoryWriteEnv "
+                    "with answer_llm_client (StreamingEvaluator wires this from the "
+                    "policy's llm_client by default, or accept an explicit override)"
+                ),
+            )
+
+        try:
+            answer, cited_memory_ids = _llm_compose_answer(
+                client=self.answer_llm_client,
+                query_text=action.query_text,
+                candidates=candidates,
+            )
+        except LLMClientError as exc:
+            return ActionExecutionResult(
+                success=False,
+                action_type="answer",
+                latency_ms=_latency_ms("answer"),
+                storage_tokens_delta=0,
+                error=f"answer composition failed: {exc}",
+            )
 
         return _success(
             "answer",
@@ -581,45 +620,6 @@ class FastMemoryWriteEnv:
                 "cited_memory_ids": cited_memory_ids,
             },
         )
-
-    def _compose_answer(
-        self,
-        query_text: str,
-        candidates: list[tuple[str, str]],
-    ) -> tuple[str, list[str]]:
-        """Compose a focused answer from retrieved memories.
-
-        Uses the configured ``answer_llm_client`` when available so the
-        candidate answer reflects only the relevant memories, and cites
-        exactly the memories used. Falls back to the top-1 retrieved
-        memory deterministically on any LLM failure.
-        """
-
-        if self.answer_llm_client is not None:
-            composed = _llm_compose_answer(
-                client=self.answer_llm_client,
-                query_text=query_text,
-                candidates=candidates,
-            )
-            if composed is not None:
-                answer, llm_cited = composed
-                allowed_ids = {memory_id for memory_id, _ in candidates}
-                cited = [mid for mid in llm_cited if mid in allowed_ids]
-                # Remove duplicate ids while keeping order.
-                seen: set[str] = set()
-                ordered_cited = [mid for mid in cited if not (mid in seen or seen.add(mid))]
-                if not ordered_cited and answer.strip() and answer.strip() != _ANSWER_ABSTENTION_TEXT:
-                    # Defensive: a non-abstention answer with no citations is
-                    # almost always the LLM hallucinating. Fall back to top-1
-                    # so evidence_correct stays honest.
-                    return self._top1_answer(candidates)
-                return answer.strip(), ordered_cited
-        return self._top1_answer(candidates)
-
-    @staticmethod
-    def _top1_answer(candidates: list[tuple[str, str]]) -> tuple[str, list[str]]:
-        memory_id, content = candidates[0]
-        return content, [memory_id]
 
     def _index_memory(self, memory_id: str, *, available_at_ms: float) -> MemoryRecord:
         memory = self.memory_store.require(memory_id)
@@ -756,22 +756,54 @@ def _retrieved_content(result: SearchResult | None) -> str | None:
     return result.content or None
 
 
+_COMPOSE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "compose_answer",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "answer": {"type": "string"},
+                "cited_memory_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["answer", "cited_memory_ids"],
+        },
+    },
+}
+
+_COMPOSE_MAX_RETRIES = 2
+
+
+class _ComposeValidationError(ValueError):
+    """Raised when the compose response violates the contract."""
+
+
 def _llm_compose_answer(
     *,
     client: LLMClient,
     query_text: str,
     candidates: list[tuple[str, str]],
-) -> tuple[str, list[str]] | None:
-    """Ask the LLM to write a focused answer + cite only the memories it used.
+) -> tuple[str, list[str]]:
+    """Ask the LLM to compose a focused answer and cite only memories used.
 
-    Returns ``(answer, cited_memory_ids)`` on success, ``None`` if the client
-    errors, refuses, or returns a malformed payload. The caller treats
-    ``None`` as "fall back to top-1" so a flaky LLM cannot silently degrade
-    or invent citations.
+    The contract is strict: the LLM must return ``{answer, cited_memory_ids}``
+    where every cited id is one of the provided candidate ids and any
+    non-abstention answer cites at least one memory. Invalid responses go
+    back through a repair loop; if the LLM cannot produce a valid response
+    after all retries the call raises ``LLMClientError`` and the env returns
+    a structured action failure (no silent fallback to top-1, no invented
+    citations).
     """
 
     import json
 
+    candidate_ids = [memory_id for memory_id, _ in candidates]
+    candidate_id_set = set(candidate_ids)
     user_payload: dict[str, object] = {
         "question": query_text,
         "candidate_memories": [
@@ -782,55 +814,98 @@ def _llm_compose_answer(
             for memory_id, content in candidates
         ],
     }
-    messages = [
+    messages: list[LLMMessage] = [
         LLMMessage(role="system", content=_ANSWER_COMPOSE_SYSTEM_PROMPT),
         LLMMessage(role="user", content=json.dumps(user_payload, sort_keys=True)),
     ]
-    try:
-        response = client.complete(
-            messages,
-            temperature=0.0,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "compose_answer",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "answer": {"type": "string"},
-                            "cited_memory_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "required": ["answer", "cited_memory_ids"],
-                    },
-                },
-            },
-        )
-    except LLMClientError:
-        return None
-    except Exception:  # pragma: no cover - defensive
-        return None
+    last_error: Exception | None = None
+    last_content = ""
+
+    for attempt in range(_COMPOSE_MAX_RETRIES + 1):
+        try:
+            response = client.complete(
+                messages,
+                temperature=0.0,
+                response_format=_COMPOSE_RESPONSE_FORMAT,
+            )
+        except LLMClientError as exc:
+            last_error = exc
+            if attempt >= _COMPOSE_MAX_RETRIES:
+                raise
+            continue
+
+        last_content = response.content
+        try:
+            return _parse_compose_response(response, candidate_id_set)
+        except _ComposeValidationError as exc:
+            last_error = exc
+            if attempt >= _COMPOSE_MAX_RETRIES:
+                raise LLMClientError(
+                    f"compose validation failed after {_COMPOSE_MAX_RETRIES + 1} attempts: {exc}"
+                ) from exc
+            messages = [
+                *messages,
+                LLMMessage(role="assistant", content=last_content or "<empty response>"),
+                LLMMessage(
+                    role="user",
+                    content=(
+                        "Repair the previous response. Return JSON only as "
+                        '{"answer": str, "cited_memory_ids": [str]}. '
+                        f"cited_memory_ids must be a non-empty subset of {candidate_ids} "
+                        "for any non-abstention answer; for abstention return the exact "
+                        f'string "{_ANSWER_ABSTENTION_TEXT}" with cited_memory_ids=[]. '
+                        f"Validation error: {exc}"
+                    ),
+                ),
+            ]
+
+    raise LLMClientError(
+        f"compose did not produce a valid response after {_COMPOSE_MAX_RETRIES + 1} attempts: "
+        f"{last_error}"
+    )
+
+
+def _parse_compose_response(
+    response, candidate_id_set: set[str]
+) -> tuple[str, list[str]]:
+    import json
 
     payload: object = response.parsed_json
     if payload is None:
         try:
             payload = json.loads(response.content or "")
-        except (json.JSONDecodeError, TypeError):
-            return None
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise _ComposeValidationError(f"non-JSON response: {exc}") from exc
     if not isinstance(payload, dict):
-        return None
+        raise _ComposeValidationError("response must be a JSON object")
     answer = payload.get("answer")
     cited_raw = payload.get("cited_memory_ids", [])
-    if not isinstance(answer, str):
-        return None
+    if not isinstance(answer, str) or not answer.strip():
+        raise _ComposeValidationError("answer must be a non-empty string")
     if not isinstance(cited_raw, list):
-        return None
+        raise _ComposeValidationError("cited_memory_ids must be a list of strings")
+
     cited: list[str] = []
+    seen: set[str] = set()
     for value in cited_raw:
-        if isinstance(value, str):
-            cited.append(value)
-    return answer, cited
+        if not isinstance(value, str):
+            raise _ComposeValidationError("cited_memory_ids entries must be strings")
+        if value not in candidate_id_set:
+            raise _ComposeValidationError(
+                f"cited memory_id {value!r} is not in the provided candidates"
+            )
+        if value in seen:
+            continue
+        seen.add(value)
+        cited.append(value)
+
+    is_abstention = answer.strip() == _ANSWER_ABSTENTION_TEXT
+    if is_abstention:
+        if cited:
+            raise _ComposeValidationError("abstention answers must not cite any memories")
+        return _ANSWER_ABSTENTION_TEXT, []
+    if not cited:
+        raise _ComposeValidationError(
+            "non-abstention answer must cite at least one of the provided memory_ids"
+        )
+    return answer.strip(), cited

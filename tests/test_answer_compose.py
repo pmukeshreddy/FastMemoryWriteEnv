@@ -1,25 +1,27 @@
 """Tests for the env's LLM-as-composer answer path.
 
-The env's old ``_answer`` concatenated every retrieved memory into one string,
-which polluted single-fact answers with unrelated retrieved facts and caused
-the LLM judge to (correctly) mark them ``NO``. The new path:
-
-* When ``answer_llm_client`` is configured, asks the LLM to write a focused
-  answer and return the exact ``cited_memory_ids`` it actually used. The env
-  intersects those with the retrieved set so the LLM cannot invent citations.
-* Falls back to a deterministic top-1 answer (single citation) if no client
-  is configured, the client raises, returns malformed JSON, or returns a
-  non-abstention answer with no citations.
+The env composes per-query answers through a single LLM call. There is no
+silent fallback to deterministic top-1; if the configured client cannot
+produce a valid composition after retries, the answer action fails loudly
+with a structured error so the caller cannot mistake a degraded answer for
+a real one.
 """
 
 from __future__ import annotations
 
 import json
 
-from fast_memory_write_env.actions import AnswerAction, SearchMemoryAction, WriteMemoryAction
+import pytest
+
+from fast_memory_write_env.actions import (
+    ActionType,
+    AnswerAction,
+    SearchMemoryAction,
+    WriteMemoryAction,
+)
 from fast_memory_write_env.env import FastMemoryWriteEnv
 from fast_memory_write_env.in_memory_index import InMemoryIndex
-from fast_memory_write_env.llm_client import MockLLMClient
+from fast_memory_write_env.llm_client import LLMClientError, LLMMessage, LLMResponse, MockLLMClient
 from fast_memory_write_env.schemas import EventCategory, EventFact, RawEvent
 from fast_memory_write_env.stores import MemoryStore, RawEventStore
 
@@ -58,7 +60,11 @@ def _build_env(tmp_path, *, answer_llm_client=None) -> FastMemoryWriteEnv:
 
 def _seed_two_memories(env: FastMemoryWriteEnv) -> tuple[str, str]:
     e_dee = _make_event("event-dee", "account-dee reported deployment window 1 at 09:00 UTC.")
-    e_ada = _make_event("event-ada", "account-ada now prefers SMS instead of email for renewal notices.", timestamp_ms=10)
+    e_ada = _make_event(
+        "event-ada",
+        "account-ada now prefers SMS instead of email for renewal notices.",
+        timestamp_ms=10,
+    )
     env.execute_action({"action_type": "store_raw", "event": e_dee.model_dump(mode="json")})
     env.execute_action({"action_type": "store_raw", "event": e_ada.model_dump(mode="json")})
     env.execute_action(
@@ -82,34 +88,27 @@ def _seed_two_memories(env: FastMemoryWriteEnv) -> tuple[str, str]:
     return "mem-dee", "mem-ada"
 
 
-def test_top1_fallback_when_no_llm_client(tmp_path) -> None:
-    """Without an LLM client the env answers with the single best memory,
-    not a concatenation of every retrieved hit."""
+def test_answer_action_fails_loudly_when_no_llm_client(tmp_path) -> None:
+    """No silent top-1 fallback. The action result must surface the failure
+    so the caller can fix the configuration."""
 
-    env = _build_env(tmp_path)
+    env = _build_env(tmp_path, answer_llm_client=None)
     dee_id, ada_id = _seed_two_memories(env)
 
-    env.execute_action(
-        SearchMemoryAction(
-            query_text="What deployment window was reported for account-dee?",
-            top_k=5,
-        )
-    )
+    env.execute_action(SearchMemoryAction(query_text="dee deployment window?", top_k=5))
     answer = env.execute_action(
         AnswerAction(
-            query_text="What deployment window was reported for account-dee?",
+            query_text="dee deployment window?",
             retrieved_memory_ids=[dee_id, ada_id],
         )
     )
 
-    assert answer.success is True
-    assert answer.payload["answer"] == "account-dee reported deployment window 1 at 09:00 UTC."
-    assert answer.payload["cited_memory_ids"] == [dee_id]
+    assert answer.success is False
+    assert answer.action_type == ActionType.ANSWER
+    assert "answer_llm_client" in (answer.error or "")
 
 
 def test_llm_compose_drops_irrelevant_memories(tmp_path) -> None:
-    """The LLM answers only with the relevant memory and cites only it."""
-
     composed = {
         "answer": "Account-dee's deployment window was reported at 09:00 UTC.",
         "cited_memory_ids": ["mem-dee"],
@@ -118,12 +117,9 @@ def test_llm_compose_drops_irrelevant_memories(tmp_path) -> None:
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
-    env.execute_action(
-        SearchMemoryAction(
-            query_text="What deployment window was reported for account-dee?",
-            top_k=5,
-        )
-    )
+    # Use a query that matches BOTH memories ("account") so the env passes
+    # both candidates to the LLM and we verify it picks only the relevant one.
+    env.execute_action(SearchMemoryAction(query_text="account deployment SMS", top_k=5))
     answer = env.execute_action(
         AnswerAction(
             query_text="What deployment window was reported for account-dee?",
@@ -136,80 +132,73 @@ def test_llm_compose_drops_irrelevant_memories(tmp_path) -> None:
     # The unrelated SMS memory must not leak into the answer.
     assert "SMS" not in answer.payload["answer"]
     assert answer.payload["cited_memory_ids"] == [dee_id]
-    # The compose call carried both candidates so the LLM had to pick.
     user_message = json.loads(client.calls[0][-1].content)
     assert {m["memory_id"] for m in user_message["candidate_memories"]} == {dee_id, ada_id}
 
 
-def test_llm_compose_invented_citations_are_dropped(tmp_path) -> None:
-    """Cited IDs not in the retrieved set must not appear in the env's payload;
-    the env intersects with the retrieved set defensively."""
+def test_compose_retries_on_invalid_citations_and_succeeds(tmp_path) -> None:
+    """A first response that cites a non-candidate id is rejected; the env
+    sends a repair message and accepts the corrected response."""
 
-    composed = {
+    bad = {"answer": "answer", "cited_memory_ids": ["mem-fabricated"]}
+    good = {
         "answer": "Account-dee's deployment window was reported at 09:00 UTC.",
-        "cited_memory_ids": ["mem-dee", "mem-fabricated"],
+        "cited_memory_ids": ["mem-dee"],
     }
-    client = MockLLMClient(responses=[composed])
+    client = MockLLMClient(responses=[bad, good])
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
-    env.execute_action(SearchMemoryAction(query_text="dee deployment window?", top_k=5))
+    env.execute_action(SearchMemoryAction(query_text="dee?", top_k=5))
     answer = env.execute_action(
-        AnswerAction(
-            query_text="dee deployment window?",
-            retrieved_memory_ids=[dee_id, ada_id],
-        )
+        AnswerAction(query_text="dee?", retrieved_memory_ids=[dee_id, ada_id])
     )
 
+    assert answer.success is True
     assert answer.payload["cited_memory_ids"] == [dee_id]
+    # First call + one repair retry.
+    assert len(client.calls) == 2
+    assert "Repair the previous response" in client.calls[1][-1].content
 
 
-def test_llm_compose_falls_back_to_top1_when_client_errors(tmp_path) -> None:
-    """A bad response from the LLM should not regress the env to abstention or
-    silent failure; we fall back to the deterministic top-1 answer."""
+def test_compose_fails_loudly_after_exhausted_retries(tmp_path) -> None:
+    """Three malformed responses (initial + 2 retries) must surface a
+    structured failure rather than degrade silently."""
 
-    client = MockLLMClient(responses=["this is not json"])
+    bad = {"answer": "x", "cited_memory_ids": ["mem-fabricated"]}
+    client = MockLLMClient(responses=[bad, bad, bad])
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
-    env.execute_action(SearchMemoryAction(query_text="dee deployment window?", top_k=5))
+    env.execute_action(SearchMemoryAction(query_text="dee?", top_k=5))
     answer = env.execute_action(
-        AnswerAction(
-            query_text="dee deployment window?",
-            retrieved_memory_ids=[dee_id, ada_id],
-        )
+        AnswerAction(query_text="dee?", retrieved_memory_ids=[dee_id, ada_id])
     )
 
-    assert answer.payload["answer"] == "account-dee reported deployment window 1 at 09:00 UTC."
-    assert answer.payload["cited_memory_ids"] == [dee_id]
+    assert answer.success is False
+    assert "answer composition failed" in (answer.error or "")
+    assert len(client.calls) == 3
 
 
-def test_llm_compose_falls_back_to_top1_when_answer_has_no_citations(tmp_path) -> None:
-    """A non-abstention answer with empty citations is almost always the LLM
-    hallucinating; fall back so evidence_correct stays honest."""
+def test_compose_rejects_non_abstention_with_no_citations(tmp_path) -> None:
+    """A non-abstention answer without citations is treated as invalid; the
+    env retries (and ultimately fails if the LLM keeps producing it)."""
 
-    composed = {"answer": "Some claim without any citation.", "cited_memory_ids": []}
-    client = MockLLMClient(responses=[composed])
+    hallucinated = {"answer": "Some claim without any citation.", "cited_memory_ids": []}
+    client = MockLLMClient(responses=[hallucinated, hallucinated, hallucinated])
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
-    env.execute_action(SearchMemoryAction(query_text="dee deployment window?", top_k=5))
+    env.execute_action(SearchMemoryAction(query_text="dee?", top_k=5))
     answer = env.execute_action(
-        AnswerAction(
-            query_text="dee deployment window?",
-            retrieved_memory_ids=[dee_id, ada_id],
-        )
+        AnswerAction(query_text="dee?", retrieved_memory_ids=[dee_id, ada_id])
     )
 
-    # Top-1 fallback engaged: the answer is the best memory's content,
-    # cited_memory_ids contains exactly that memory.
-    assert answer.payload["cited_memory_ids"] == [dee_id]
-    assert answer.payload["answer"] == "account-dee reported deployment window 1 at 09:00 UTC."
+    assert answer.success is False
+    assert len(client.calls) == 3
 
 
-def test_llm_compose_passes_through_abstention(tmp_path) -> None:
-    """If the LLM abstains, that's a valid answer with empty citations."""
-
+def test_compose_passes_through_abstention(tmp_path) -> None:
     composed = {
         "answer": "I do not know from indexed memory.",
         "cited_memory_ids": [],
@@ -218,28 +207,80 @@ def test_llm_compose_passes_through_abstention(tmp_path) -> None:
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
-    env.execute_action(SearchMemoryAction(query_text="dee deployment window?", top_k=5))
+    env.execute_action(SearchMemoryAction(query_text="dee?", top_k=5))
+    answer = env.execute_action(
+        AnswerAction(query_text="dee?", retrieved_memory_ids=[dee_id, ada_id])
+    )
+
+    assert answer.success is True
+    assert answer.payload["answer"] == "I do not know from indexed memory."
+    assert answer.payload["cited_memory_ids"] == []
+
+
+def test_compose_retries_then_fails_on_persistent_client_errors(tmp_path) -> None:
+    """LLMClientError is retried up to the budget; persistent errors surface
+    as a structured action failure."""
+
+    class _AlwaysErrors:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, messages, *, temperature=0.0, response_format=None):
+            self.calls += 1
+            raise LLMClientError("transient network failure")
+
+    client = _AlwaysErrors()
+    env = _build_env(tmp_path, answer_llm_client=client)
+    dee_id, ada_id = _seed_two_memories(env)
+
+    env.execute_action(SearchMemoryAction(query_text="dee?", top_k=5))
+    answer = env.execute_action(
+        AnswerAction(query_text="dee?", retrieved_memory_ids=[dee_id, ada_id])
+    )
+
+    assert answer.success is False
+    assert "transient network failure" in (answer.error or "")
+    assert client.calls == 3  # initial + 2 retries
+
+
+def test_answer_returns_abstention_without_consulting_llm_when_no_retrieval(tmp_path) -> None:
+    """Empty retrieval is the one case that does not need the LLM: there is
+    nothing to compose from, so abstention is the principled response."""
+
+    class _Boom:
+        calls = 0
+
+        def complete(self, messages, *, temperature=0.0, response_format=None):
+            type(self).calls += 1
+            raise AssertionError("LLM should not be consulted when retrieval is empty")
+
+    env = _build_env(tmp_path, answer_llm_client=_Boom())
+
+    answer = env.execute_action(
+        AnswerAction(query_text="anything?", retrieved_memory_ids=[])
+    )
+
+    assert answer.success is True
+    assert answer.payload["answer"] == "I do not know from indexed memory."
+    assert answer.payload["cited_memory_ids"] == []
+    assert _Boom.calls == 0
+
+
+def test_mock_client_default_compose_response_serves_top_candidate(tmp_path) -> None:
+    """Default MockLLMClient (no queued responses) routes by request shape and
+    returns the top candidate as the cited memory. This is the mock's
+    deterministic behavior, not a fallback inside the env."""
+
+    env = _build_env(tmp_path, answer_llm_client=MockLLMClient())
+    dee_id, ada_id = _seed_two_memories(env)
+
+    env.execute_action(SearchMemoryAction(query_text="account-dee deployment", top_k=5))
     answer = env.execute_action(
         AnswerAction(
-            query_text="dee deployment window?",
+            query_text="account-dee deployment",
             retrieved_memory_ids=[dee_id, ada_id],
         )
     )
 
-    assert answer.payload["answer"] == "I do not know from indexed memory."
-    assert answer.payload["cited_memory_ids"] == []
-
-
-def test_answer_returns_abstention_when_no_memories_retrieved(tmp_path) -> None:
-    """An empty retrieval set is still abstention; the LLM is not consulted."""
-
-    client = MockLLMClient()  # would raise on a non-policy request
-    env = _build_env(tmp_path, answer_llm_client=client)
-
-    answer = env.execute_action(
-        AnswerAction(query_text="Anything?", retrieved_memory_ids=[])
-    )
-
-    assert answer.payload["answer"] == "I do not know from indexed memory."
-    assert answer.payload["cited_memory_ids"] == []
-    assert client.calls == []
+    assert answer.success is True
+    assert answer.payload["cited_memory_ids"] == [dee_id]

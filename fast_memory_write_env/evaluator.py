@@ -269,6 +269,7 @@ class StreamingEvaluator:
         indexing_budget_operations_remaining: int = 3,
         run_config: RunConfig | dict[str, Any] | None = None,
         judge_llm_client: LLMClient | None = None,
+        answer_llm_client: LLMClient | None = None,
     ) -> None:
         self.env = env
         self.policy = policy
@@ -285,6 +286,17 @@ class StreamingEvaluator:
             if judge_llm_client is not None
             else getattr(policy, "llm_client", None)
         )
+        # The env composes per-query answers through an LLM. When a caller
+        # constructs the env directly (legacy / unit-test path) and the
+        # policy carries a usable client, propagate it so the env is fully
+        # configured end-to-end. An explicit override always wins.
+        resolved_answer_client = (
+            answer_llm_client
+            if answer_llm_client is not None
+            else getattr(policy, "llm_client", None)
+        )
+        if resolved_answer_client is not None and getattr(env, "answer_llm_client", None) is None:
+            env.answer_llm_client = resolved_answer_client
 
     @classmethod
     def with_local_test_index(

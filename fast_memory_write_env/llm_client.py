@@ -133,7 +133,7 @@ class OpenAICompatibleLLMClient:
 
 
 class MockLLMClient:
-    """Deterministic LLM client for policy tests."""
+    """Deterministic LLM client for policy and compose tests."""
 
     def __init__(self, responses: list[str | dict[str, Any] | list[Any]] | None = None) -> None:
         self._responses = list(responses or [])
@@ -155,12 +155,23 @@ class MockLLMClient:
                 return LLMResponse(content=response, parsed_json=_loads_json_or_none(response), model="mock")
             return LLMResponse(content=json.dumps(response), parsed_json=response, model="mock")
 
-        plan = _default_mock_plan(messages)
-        return LLMResponse(content=json.dumps(plan), parsed_json=plan, model="mock")
+        # No queued response: route by request shape so the same MockLLMClient
+        # serves both LLMMemoryWritePolicy and the env's answer-compose call.
+        request = _try_extract_request_json(messages)
+        if request is not None and "new_event" in request:
+            plan = _default_mock_plan_from_request(request)
+            return LLMResponse(content=json.dumps(plan), parsed_json=plan, model="mock")
+        if request is not None and "candidate_memories" in request:
+            compose = _default_mock_compose_from_request(request)
+            return LLMResponse(content=json.dumps(compose), parsed_json=compose, model="mock")
+        raise LLMClientError("MockLLMClient could not classify request shape")
 
 
 def _default_mock_plan(messages: list[LLMMessage]) -> dict[str, Any]:
-    request = _extract_request_json(messages)
+    return _default_mock_plan_from_request(_extract_request_json(messages))
+
+
+def _default_mock_plan_from_request(request: dict[str, Any]) -> dict[str, Any]:
     event = request["new_event"]
     active_memories = list(request.get("active_memories", []))
     indexing_budget = int(request.get("budgets", {}).get("indexing_budget_operations_remaining", 0))
@@ -219,6 +230,41 @@ def _extract_request_json(messages: list[LLMMessage]) -> dict[str, Any]:
         if isinstance(payload, dict) and "new_event" in payload:
             return payload
     raise LLMClientError("MockLLMClient could not find policy request JSON")
+
+
+def _try_extract_request_json(messages: list[LLMMessage]) -> dict[str, Any] | None:
+    """Return the latest JSON-shaped user message, or ``None`` if there is none."""
+
+    for message in reversed(messages):
+        if message.role != "user":
+            continue
+        try:
+            payload = json.loads(message.content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _default_mock_compose_from_request(request: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic compose response for tests: cite the top-ranked memory.
+
+    The env passes ``candidate_memories`` ordered by retrieval rank, so picking
+    the first one mirrors a focused single-memory answer. This is not a
+    fallback inside the env — it is the mock client's deterministic behavior
+    for the compose request shape.
+    """
+
+    candidates = request.get("candidate_memories", []) or []
+    if not candidates:
+        return {"answer": "I do not know from indexed memory.", "cited_memory_ids": []}
+    top = candidates[0]
+    memory_id = str(top.get("memory_id", ""))
+    content = str(top.get("content", ""))
+    if not memory_id or not content:
+        return {"answer": "I do not know from indexed memory.", "cited_memory_ids": []}
+    return {"answer": content, "cited_memory_ids": [memory_id]}
 
 
 def _looks_low_value_or_duplicate(content: str) -> bool:

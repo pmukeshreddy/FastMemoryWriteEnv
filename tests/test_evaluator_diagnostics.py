@@ -32,6 +32,7 @@ from fast_memory_write_env.evaluator import (
 )
 from fast_memory_write_env.hybrid_index import HybridRetrievalIndex
 from fast_memory_write_env.in_memory_index import InMemoryIndex
+from fast_memory_write_env.llm_client import MockLLMClient
 from fast_memory_write_env.index import estimate_tokens
 from fast_memory_write_env.schemas import (
     DatasetMode,
@@ -52,6 +53,7 @@ def _build_env(tmp_path: Path) -> FastMemoryWriteEnv:
         raw_event_store=RawEventStore(tmp_path / "raw.sqlite"),
         memory_store=MemoryStore(tmp_path / "memory.sqlite"),
         retrieval_index=InMemoryIndex(),
+        answer_llm_client=MockLLMClient(),
     )
 
 
@@ -66,6 +68,7 @@ def _build_hybrid_env(tmp_path: Path) -> FastMemoryWriteEnv:
             vector_index=InMemoryIndex(),
             memory_store=memory_store,
         ),
+        answer_llm_client=MockLLMClient(),
     )
 
 

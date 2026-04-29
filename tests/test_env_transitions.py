@@ -5,6 +5,7 @@ from fast_memory_write_env.env import FastMemoryWriteEnv, deterministic_memory_i
 from fast_memory_write_env.in_memory_index import InMemoryIndex
 from fast_memory_write_env.index import estimate_tokens
 from fast_memory_write_env.index import SearchResult
+from fast_memory_write_env.llm_client import MockLLMClient
 from fast_memory_write_env.schemas import DatasetMode, EventCategory, MemoryRecord, MemoryStatus
 from fast_memory_write_env.stores import MemoryStore, RawEventStore
 
@@ -14,6 +15,7 @@ def _env(tmp_path) -> FastMemoryWriteEnv:
         raw_event_store=RawEventStore(tmp_path / "raw.sqlite"),
         memory_store=MemoryStore(tmp_path / "memory.sqlite"),
         retrieval_index=InMemoryIndex(),
+        answer_llm_client=MockLLMClient(),
     )
 
 
@@ -210,6 +212,7 @@ def test_environment_rejects_second_index_when_index_budget_is_exhausted(tmp_pat
         retrieval_index=InMemoryIndex(),
         storage_budget_tokens_remaining=100,
         indexing_budget_operations_remaining=1,
+        answer_llm_client=MockLLMClient(),
     )
     _, events = _events_by_category()
     useful = events[EventCategory.USEFUL_FACT]
@@ -252,6 +255,7 @@ def test_environment_rejects_second_write_when_storage_budget_is_exhausted(tmp_p
         retrieval_index=InMemoryIndex(),
         storage_budget_tokens_remaining=1,
         indexing_budget_operations_remaining=10,
+        answer_llm_client=MockLLMClient(),
     )
     _, events = _events_by_category()
     useful = events[EventCategory.USEFUL_FACT]
@@ -337,6 +341,7 @@ def test_answer_uses_retrieved_content_before_sqlite_lookup(tmp_path) -> None:
         raw_event_store=RawEventStore(tmp_path / "raw.sqlite"),
         memory_store=MemoryStore(tmp_path / "memory.sqlite"),
         retrieval_index=_RetrievalContentOnlyIndex(),
+        answer_llm_client=MockLLMClient(),
     )
 
     search = env.execute_action(

@@ -9,6 +9,7 @@ from fast_memory_write_env.env import FastMemoryWriteEnv
 from fast_memory_write_env.evaluator import _AsyncMemoryWriteWorker, StreamingEvaluator
 from fast_memory_write_env.in_memory_index import InMemoryIndex
 from fast_memory_write_env.index import estimate_tokens
+from fast_memory_write_env.llm_client import MockLLMClient
 from fast_memory_write_env.metrics import AggregateCounterSnapshot
 from fast_memory_write_env.schemas import (
     DatasetMode,
@@ -28,6 +29,7 @@ from fast_memory_write_env.stores import MemoryStore, RawEventStore
 class _IgnorePolicy:
     def __init__(self) -> None:
         self.calls = 0
+        self.llm_client = MockLLMClient()
 
     def decide(self, *, new_event, active_memories, recent_events, latency_budget_ms, storage_budget_tokens_remaining, indexing_budget_operations_remaining):
         self.calls += 1
@@ -45,6 +47,7 @@ class _IgnorePolicy:
 class _RecordingBudgetPolicy:
     def __init__(self) -> None:
         self.calls: list[tuple[int, int]] = []
+        self.llm_client = MockLLMClient()
 
     def decide(self, *, new_event, active_memories, recent_events, latency_budget_ms, storage_budget_tokens_remaining, indexing_budget_operations_remaining):
         self.calls.append((storage_budget_tokens_remaining, indexing_budget_operations_remaining))
@@ -73,6 +76,9 @@ class _RecordingBudgetPolicy:
 
 
 class _WriteAndIndexPolicy:
+    def __init__(self) -> None:
+        self.llm_client = MockLLMClient()
+
     def decide(self, *, new_event, active_memories, recent_events, latency_budget_ms, storage_budget_tokens_remaining, indexing_budget_operations_remaining):
         return validate_memory_actions(
             [
@@ -89,6 +95,9 @@ class _WriteAndIndexPolicy:
 
 
 class _ColorUpdatePolicy:
+    def __init__(self) -> None:
+        self.llm_client = MockLLMClient()
+
     def decide(self, *, new_event, active_memories, recent_events, latency_budget_ms, storage_budget_tokens_remaining, indexing_budget_operations_remaining):
         if new_event.event_id == "event-blue":
             return validate_memory_actions(
