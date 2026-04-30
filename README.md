@@ -113,7 +113,7 @@ python3 scripts/run_eval_multi.py \
   --dataset longmemeval \
   --longmemeval-path data/longmemeval/longmemeval_s_cleaned.json \
   --samples 50 \
-  --concurrent-samples 1 \
+  --concurrent-samples 50 \
   --write-worker-concurrency 8 \
   --output-dir results/lme_50
 ```
