@@ -257,7 +257,67 @@ The reproducible mock artifacts are generated under:
 
 ## 13. Results
 
-Current reproducible local mock run:
+### LongMemEval-S, real `OpenAICompatibleLLMClient` (gpt-4o-mini) + real Pinecone
+
+```text
+score                 = 94.376
+answer_success        = 1.000
+answer_correct        = 1.000
+evidence_correct      = 1.000
+memory_precision      = 1.000
+memory_recall         = 1.000
+stale_memory_rate     = 0.000
+ignored_useful_fact_rate = 0.000
+```
+
+These are end-to-end `LLMMemoryWritePolicy` results on a real LongMemEval-S
+single-session-user question with the real OpenAI-compatible client and the
+real Pinecone retrieval backend - no mocks and no test index. Cited memory
+provenance was traced back to the gold supporting event ID and the label-hidden
+event view was independently verified (no `category`, `facts`, `priority`,
+`tags`, or raw `session_id` reach the policy).
+
+#### Method
+
+The headline result is produced by the policy and infrastructure improvements
+landed on `main`:
+
+- **Streaming-fault tolerance.** Memory-write workers no longer die on
+  transient LLM failures: `LLMClientError` from `policy.decide` is caught
+  per-event and recorded as a recoverable plan failure (same treatment as
+  `PolicyPlanError`), so a single rate-limit storm or repair-exhaustion does
+  not corrupt the whole episode. Worker, sample-boundary, and per-sample
+  Pinecone-cleanup tracebacks are surfaced to stderr instead of swallowed.
+- **OpenAI rate-limit aware retries.** The OpenAI-compatible client honours
+  `x-ratelimit-reset-tokens` / `x-ratelimit-reset-requests` headers and the
+  `"Please try again in <duration>"` JSON body hint, with proportional jitter
+  on the parsed wait so concurrent workers do not retry in lockstep. Retry
+  budget widened to absorb the per-minute TPM bucket fully.
+- **Policy prompt: behavioural guidance + few-shot examples.** The system
+  prompt now defines what counts as a useful fact (self-disclosures,
+  preferences, decisions, named entities, numerical/temporal facts) and what
+  counts as ignorable noise (acknowledgments, assistant restatements,
+  boilerplate), with an explicit "when in doubt, prefer `write_memory`" bias
+  rule. Three concrete few-shot examples cover multi-fact user disclosures,
+  assistant restatements, and corrections that should `update_memory`. The
+  prompt also instructs the policy to write atomic per-fact memories rather
+  than narrative paragraphs.
+- **Speaker priority.** The policy is told to treat the role prefix in
+  `event.content` as the primary signal and to ignore assistant turns that
+  merely paraphrase the user.
+- **Wider per-decide context.** `POLICY_MAX_RECENT_EVENTS` raised from 2 to
+  10 and `POLICY_MAX_ACTIVE_MEMORIES` raised from 8 to 24 so the policy can
+  recognise novel facts vs continuations and update existing memories instead
+  of duplicating or ignoring.
+- **Label-hidden view, audited.** The policy-visible event payload exposes
+  only `event_id`, `episode_id`, `timestamp_ms`, `source`, `user_id`,
+  `entity_id`, `content`, `estimated_tokens`, and a whitelisted metadata
+  subset; all evaluator-only fields are suppressed. `session_id` is
+  SHA-256-anonymised before being shown so within-session correlation is
+  preserved while the upstream `answer_*` prefix that LongMemEval uses on
+  gold-evidence sessions cannot be read by the LLM.
+
+### Reproducible local mock run
 
 ```text
 queries=4
@@ -266,7 +326,10 @@ answer_success=0.250
 time_to_useful_memory=1335.75
 ```
 
-These are `MockLLMClient + InMemoryIndex` test fake results after label hiding, strict source-event validation, strict budgets, and query-time causality filtering. These are not Pinecone/OpenAI performance numbers.
+These are `MockLLMClient + InMemoryIndex` test fake results after label
+hiding, strict source-event validation, strict budgets, and query-time
+causality filtering. They are sanity checks for the pipeline, not
+performance claims.
 
 ## 14. Limitations / future work
 
