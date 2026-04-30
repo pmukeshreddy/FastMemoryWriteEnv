@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+
 from fast_memory_write_env.evaluator import StreamingEvaluator, write_evaluation_outputs
 from fast_memory_write_env.llm_client import OpenAICompatibleLLMClient
 from fast_memory_write_env.longmemeval import load_longmemeval_episodes
