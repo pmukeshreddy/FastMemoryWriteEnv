@@ -60,7 +60,7 @@ def test_episode_accepts_interleaved_event_and_query_stream() -> None:
 
     episode = StreamingEpisode(
         episode_id="ep-small-0",
-        mode=DatasetMode.SMALL,
+        mode=DatasetMode.LONGMEMEVAL,
         seed=7,
         stream=[
             StreamEventItem(timestamp_ms=100, event=event),
@@ -93,7 +93,7 @@ def test_episode_rejects_non_monotonic_stream() -> None:
     with pytest.raises(ValidationError):
         StreamingEpisode(
             episode_id="ep-small-0",
-            mode=DatasetMode.SMALL,
+            mode=DatasetMode.LONGMEMEVAL,
             seed=7,
             stream=[
                 StreamEventItem(timestamp_ms=300, event=event),

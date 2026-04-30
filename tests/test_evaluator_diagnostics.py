@@ -32,7 +32,7 @@ from fast_memory_write_env.evaluator import (
 )
 from fast_memory_write_env.hybrid_index import HybridRetrievalIndex
 from fast_memory_write_env.in_memory_index import InMemoryIndex
-from fast_memory_write_env.llm_client import MockLLMClient
+from tests._test_llm_client import DeterministicTestLLMClient
 from fast_memory_write_env.index import estimate_tokens
 from fast_memory_write_env.schemas import (
     DatasetMode,
@@ -53,7 +53,7 @@ def _build_env(tmp_path: Path) -> FastMemoryWriteEnv:
         raw_event_store=RawEventStore(tmp_path / "raw.sqlite"),
         memory_store=MemoryStore(tmp_path / "memory.sqlite"),
         retrieval_index=InMemoryIndex(),
-        answer_llm_client=MockLLMClient(),
+        answer_llm_client=DeterministicTestLLMClient(),
     )
 
 
@@ -68,7 +68,7 @@ def _build_hybrid_env(tmp_path: Path) -> FastMemoryWriteEnv:
             vector_index=InMemoryIndex(),
             memory_store=memory_store,
         ),
-        answer_llm_client=MockLLMClient(),
+        answer_llm_client=DeterministicTestLLMClient(),
     )
 
 
@@ -77,7 +77,7 @@ class _AdaUpdateAndStalePolicy:
 
     def __init__(self) -> None:
         self.first_call = True
-        self.llm_client = MockLLMClient()
+        self.llm_client = DeterministicTestLLMClient()
 
     def decide(
         self,
@@ -118,7 +118,7 @@ class _BenDelayedIndexPolicy:
     """Two delayed-index memories. Indexing budget is one operation."""
 
     def __init__(self) -> None:
-        self.llm_client = MockLLMClient()
+        self.llm_client = DeterministicTestLLMClient()
 
     def decide(
         self,
@@ -149,7 +149,7 @@ class _DeeCompressionPolicy:
 
     def __init__(self) -> None:
         self.calls = 0
-        self.llm_client = MockLLMClient()
+        self.llm_client = DeterministicTestLLMClient()
 
     def decide(
         self,
@@ -274,7 +274,7 @@ def _episode_for_ada() -> StreamingEpisode:
     )
     return StreamingEpisode(
         episode_id="ep-diagnostics",
-        mode=DatasetMode.SMALL,
+        mode=DatasetMode.LONGMEMEVAL,
         seed=0,
         stream=[
             StreamEventItem(timestamp_ms=first.timestamp_ms, event=first),
@@ -314,7 +314,7 @@ def _episode_for_ben_or_dee() -> StreamingEpisode:
     )
     return StreamingEpisode(
         episode_id="ep-diagnostics",
-        mode=DatasetMode.SMALL,
+        mode=DatasetMode.LONGMEMEVAL,
         seed=0,
         stream=[
             StreamEventItem(timestamp_ms=first.timestamp_ms, event=first),

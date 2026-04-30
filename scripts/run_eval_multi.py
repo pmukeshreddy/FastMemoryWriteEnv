@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Run a multi-episode streaming evaluation and aggregate metrics.
+"""Run a multi-episode LongMemEval evaluation and aggregate metrics.
 
-Each ``sample`` is one full streaming episode: the LLM policy decides
-write/update/index/etc actions for the whole event stream, then every
-query in the episode is composed and judged independently. ``--samples 20``
-runs 20 distinct episodes (different seeds and/or episode_indices, never
-repeated), producing roughly 4*20 = 80 queries on the ``small`` mode.
+Each ``sample`` is one full LongMemEval episode: the LLM policy decides
+write/update/index/etc actions for the whole event stream, then the query
+in the episode is composed and judged independently.
 
 Per-episode artifacts land under ``<output_dir>/sample_<NN>/`` and a
 combined aggregate is written at ``<output_dir>/aggregate_summary.json``.
@@ -27,16 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tqdm.auto import tqdm
 
-from fast_memory_write_env.dataset import (
-    SYNTHETIC_DATASET_MODES,
-    generate_dataset,
-)
 from fast_memory_write_env.evaluator import (
     StreamingEvaluator,
     build_failure_diagnostics,
     write_evaluation_outputs,
 )
-from fast_memory_write_env.llm_client import MockLLMClient, OpenAICompatibleLLMClient
+from fast_memory_write_env.llm_client import OpenAICompatibleLLMClient
 from fast_memory_write_env.longmemeval import load_longmemeval_episodes
 from fast_memory_write_env.metrics import (
     AggregateCounterSnapshot,
@@ -76,31 +70,15 @@ def _truncate_episode_events(episode: StreamingEpisode, *, max_events: int) -> S
     return episode.model_copy(update={"stream": new_stream})
 
 
-def _synthetic_episode_iter(mode: DatasetMode, *, start_seed: int):
-    """Yield ``(seed, episode_index, episode)`` synthetic tuples without repeats.
-
-    Note: the synthetic generator uses one fixed story template per episode
-    and only varies entity names / noise / ordering across seeds. For genuine
-    question diversity use ``--dataset longmemeval`` instead.
-    """
-
-    seed = start_seed
-    while True:
-        dataset = generate_dataset(mode=mode, seed=seed)
-        for episode in dataset.episodes:
-            yield seed, episode.metadata.get("episode_index"), episode
-        seed += 1
-
-
 def _longmemeval_episode_iter(path: str, *, start_index: int):
     """Yield ``(seed, episode_index, episode)`` from a LongMemEval JSON file.
 
     Each LongMemEval row is its own real conversation with its own diverse
-    question. ``seed`` is mirrored from the row index so the per-sample
-    print stays consistent with the synthetic path; uniqueness is enforced
-    by the index. The iterator stops once the file is exhausted, so the
-    runner will fail loudly if you ask for more samples than the file has
-    rather than silently repeat.
+    question. ``seed`` is mirrored from the row index so per-sample logs
+    have a stable identifier; uniqueness is enforced by the index. The
+    iterator stops once the file is exhausted, so the runner will fail
+    loudly if you ask for more samples than the file has rather than
+    silently repeat.
     """
 
     episodes = load_longmemeval_episodes(path)
@@ -173,7 +151,7 @@ def _evaluate_one(
     sample_slot: int,
     args,
 ):
-    llm_client = MockLLMClient() if args.mock else OpenAICompatibleLLMClient()
+    llm_client = OpenAICompatibleLLMClient()
     policy = LLMMemoryWritePolicy(llm_client=llm_client)
     run_config = RunConfig(
         dataset_mode=episode.mode.value,
@@ -182,7 +160,7 @@ def _evaluate_one(
         episode_id=episode.episode_id,
         policy_name=type(policy).__name__,
         llm_client_type=type(llm_client).__name__,
-        llm_model=getattr(llm_client, "model", "mock" if args.mock else None),
+        llm_model=getattr(llm_client, "model", None),
         llm_base_url=getattr(llm_client, "base_url", None),
         llm_api_key_configured=bool(getattr(llm_client, "api_key", None)),
         backend_type="in_memory_test" if use_test_index else "pinecone",
@@ -193,7 +171,6 @@ def _evaluate_one(
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         command="python3 " + " ".join(sys.argv),
         metadata={
-            "mock": args.mock,
             "use_test_index": args.use_test_index,
             "sample_slot": sample_slot,
         },
@@ -248,34 +225,33 @@ def _evaluate_one(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a multi-episode FastMemoryWriteEnv evaluation.")
     parser.add_argument(
-        "--dataset",
-        choices=["synthetic", "longmemeval"],
-        default="synthetic",
-        help="synthetic: use the project's templated generator (test fixture; "
-        "different seeds only swap entity names). longmemeval: use real "
-        "human-authored conversations from a LongMemEval JSON file - the "
-        "honest test for diverse questions.",
-    )
-    parser.add_argument(
         "--longmemeval-path",
-        help="Path to a LongMemEval JSON file (required when --dataset=longmemeval).",
+        required=True,
+        help="Path to a LongMemEval JSON file.",
     )
-    parser.add_argument("--mode", choices=[m.value for m in SYNTHETIC_DATASET_MODES], default=DatasetMode.SMALL.value)
     parser.add_argument(
         "--samples",
         type=int,
         default=20,
-        help="Number of distinct episodes to run. Each sample is one full streaming "
-        "episode; the runner never repeats a sample key.",
+        help="Number of distinct episodes to run. Each sample is one full "
+        "LongMemEval episode; the runner never repeats a sample key.",
     )
     parser.add_argument(
         "--start-seed",
         type=int,
-        default=7,
-        help="Starting seed (synthetic) or starting row index (longmemeval).",
+        default=0,
+        help="Starting LongMemEval row index.",
     )
-    parser.add_argument("--mock", action="store_true")
-    parser.add_argument("--use-test-index", action="store_true")
+    parser.add_argument(
+        "--use-test-index",
+        action="store_true",
+        help=(
+            "Use InMemoryIndex instead of Pinecone. The in-memory index is a "
+            "real implementation of the retrieval interface, kept only for "
+            "local checks when Pinecone credentials are not configured. Real "
+            "performance numbers must use Pinecone."
+        ),
+    )
     parser.add_argument("--output-dir", default="results/multi")
     parser.add_argument("--latency-budget-ms", type=int, default=250)
     parser.add_argument("--storage-budget", type=int, default=10_000)
@@ -340,18 +316,12 @@ def main() -> None:
         raise SystemExit("--samples must be >= 1")
     if args.concurrent_samples < 1:
         raise SystemExit("--concurrent-samples must be >= 1")
-    if args.dataset == "longmemeval" and not args.longmemeval_path:
-        raise SystemExit("--longmemeval-path is required when --dataset=longmemeval")
 
-    use_test_index = bool(args.use_test_index or args.mock)
+    use_test_index = bool(args.use_test_index)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    mode = DatasetMode(args.mode)
-    if args.dataset == "longmemeval":
-        iterator = _longmemeval_episode_iter(args.longmemeval_path, start_index=args.start_seed)
-    else:
-        iterator = _synthetic_episode_iter(mode, start_seed=args.start_seed)
+    iterator = _longmemeval_episode_iter(args.longmemeval_path, start_index=args.start_seed)
 
     per_episode_summaries: list[dict] = []
     all_query_metrics = []
@@ -503,10 +473,8 @@ def main() -> None:
 
     merged_counters = _merge_counters(all_counters)
     merged_aggregate = aggregate_metrics(all_query_metrics, merged_counters)
-    merged_subtasks = (
-        subtask_accuracy_breakdown(all_query_metrics, rollout_records=all_rollout_records)
-        if args.dataset == "longmemeval"
-        else None
+    merged_subtasks = subtask_accuracy_breakdown(
+        all_query_metrics, rollout_records=all_rollout_records
     )
     merged_score = score_metrics(merged_aggregate, subtask_accuracies=merged_subtasks)
 
@@ -530,8 +498,8 @@ def main() -> None:
         total_plan_errors += d.get("policy_plan_error_count", 0)
 
     summary = {
-        "dataset": args.dataset,
-        "mode": DatasetMode.LONGMEMEVAL.value if args.dataset == "longmemeval" else mode.value,
+        "dataset": "longmemeval",
+        "mode": DatasetMode.LONGMEMEVAL.value,
         "samples": args.samples,
         "samples_succeeded": episodes_run,
         "samples_failed": len(sample_failures),
@@ -549,7 +517,7 @@ def main() -> None:
             },
             "metrics": headline_metrics(
                 merged_aggregate,
-                dataset_mode=DatasetMode.LONGMEMEVAL.value if args.dataset == "longmemeval" else mode.value,
+                dataset_mode=DatasetMode.LONGMEMEVAL.value,
                 query_metrics=all_query_metrics,
                 rollout_records=all_rollout_records,
             ),
@@ -593,13 +561,12 @@ def main() -> None:
     print(f"AGGREGATE: samples={episodes_run}/{args.samples} (distinct episodes) queries={total_queries}")
     print(f"  score                 = {merged_score.score:.3f}")
     print(f"  answer_success        = {merged_aggregate.answer_success:.3f} ({merged_aggregate.answer_success:.1%})")
-    if args.dataset == "longmemeval":
-        print("SUB-TASK ACCURACY:")
-        for question_type, payload in (merged_subtasks or {}).items():
-            print(
-                f"  {question_type:<24} {payload['accuracy']:.3f} "
-                f"({payload['correct']}/{payload['total']})"
-            )
+    print("SUB-TASK ACCURACY:")
+    for question_type, payload in (merged_subtasks or {}).items():
+        print(
+            f"  {question_type:<24} {payload['accuracy']:.3f} "
+            f"({payload['correct']}/{payload['total']})"
+        )
     print(f"  answer_correct        = {merged_aggregate.answer_correct:.3f}")
     print(f"  evidence_correct      = {merged_aggregate.evidence_correct:.3f}")
     print(f"  memory_precision      = {merged_aggregate.memory_precision:.3f}")

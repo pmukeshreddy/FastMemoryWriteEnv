@@ -21,7 +21,8 @@ from fast_memory_write_env.actions import (
 )
 from fast_memory_write_env.env import FastMemoryWriteEnv
 from fast_memory_write_env.in_memory_index import InMemoryIndex
-from fast_memory_write_env.llm_client import LLMClientError, LLMMessage, LLMResponse, MockLLMClient
+from fast_memory_write_env.llm_client import LLMClientError, LLMMessage, LLMResponse
+from tests._test_llm_client import DeterministicTestLLMClient
 from fast_memory_write_env.schemas import EventCategory, EventFact, RawEvent
 from fast_memory_write_env.stores import MemoryStore, RawEventStore
 
@@ -113,7 +114,7 @@ def test_llm_compose_drops_irrelevant_memories(tmp_path) -> None:
         "answer": "Account-dee's deployment window was reported at 09:00 UTC.",
         "cited_memory_ids": ["mem-dee"],
     }
-    client = MockLLMClient(responses=[composed])
+    client = DeterministicTestLLMClient(responses=[composed])
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
@@ -145,7 +146,7 @@ def test_compose_retries_on_invalid_citations_and_succeeds(tmp_path) -> None:
         "answer": "Account-dee's deployment window was reported at 09:00 UTC.",
         "cited_memory_ids": ["mem-dee"],
     }
-    client = MockLLMClient(responses=[bad, good])
+    client = DeterministicTestLLMClient(responses=[bad, good])
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
@@ -166,7 +167,7 @@ def test_compose_fails_loudly_after_exhausted_retries(tmp_path) -> None:
     structured failure rather than degrade silently."""
 
     bad = {"answer": "x", "cited_memory_ids": ["mem-fabricated"]}
-    client = MockLLMClient(responses=[bad, bad, bad])
+    client = DeterministicTestLLMClient(responses=[bad, bad, bad])
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
@@ -185,7 +186,7 @@ def test_compose_rejects_non_abstention_with_no_citations(tmp_path) -> None:
     env retries (and ultimately fails if the LLM keeps producing it)."""
 
     hallucinated = {"answer": "Some claim without any citation.", "cited_memory_ids": []}
-    client = MockLLMClient(responses=[hallucinated, hallucinated, hallucinated])
+    client = DeterministicTestLLMClient(responses=[hallucinated, hallucinated, hallucinated])
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
@@ -203,7 +204,7 @@ def test_compose_passes_through_abstention(tmp_path) -> None:
         "answer": "I do not know from indexed memory.",
         "cited_memory_ids": [],
     }
-    client = MockLLMClient(responses=[composed])
+    client = DeterministicTestLLMClient(responses=[composed])
     env = _build_env(tmp_path, answer_llm_client=client)
     dee_id, ada_id = _seed_two_memories(env)
 
@@ -267,11 +268,11 @@ def test_answer_returns_abstention_without_consulting_llm_when_no_retrieval(tmp_
 
 
 def test_mock_client_default_compose_response_serves_top_candidate(tmp_path) -> None:
-    """Default MockLLMClient (no queued responses) routes by request shape and
+    """Default DeterministicTestLLMClient (no queued responses) routes by request shape and
     returns the top candidate as the cited memory. This is the mock's
     deterministic behavior, not a fallback inside the env."""
 
-    env = _build_env(tmp_path, answer_llm_client=MockLLMClient())
+    env = _build_env(tmp_path, answer_llm_client=DeterministicTestLLMClient())
     dee_id, ada_id = _seed_two_memories(env)
 
     env.execute_action(SearchMemoryAction(query_text="account-dee deployment", top_k=5))

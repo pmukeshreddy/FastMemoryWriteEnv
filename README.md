@@ -51,10 +51,9 @@ It calls an internal `LLMClient` abstraction and expects structured JSON actions
 
 The policy prompt uses a label-hidden event view. Evaluator-only labels such as event category, priority, gold facts, duplicate/contradiction links, stale labels, and memory `fact_ids` are not shown to `LLMMemoryWritePolicy`. If an LLM response includes `fact_ids`, the policy strips them before execution; scoring derives hidden evidence from source event IDs.
 
-Implemented clients:
-
-- `MockLLMClient`: deterministic local test client with no API key.
-- `OpenAICompatibleLLMClient`: calls OpenAI-compatible chat completions.
+The only production LLM client is `OpenAICompatibleLLMClient`, which calls
+OpenAI-compatible chat completions. There is no mock client in production
+code paths and no `--mock` flag - real LLM only.
 
 The policy does not mutate SQLite stores and does not call Pinecone directly.
 
@@ -89,61 +88,31 @@ Required Pinecone environment variables:
 - `PINECONE_CLOUD`
 - `PINECONE_REGION`
 
-`InMemoryIndex` exists only as a unit-test and mock-run fake. It is useful for reproducible local checks, but it is not the production retrieval path.
+`InMemoryIndex` is a real implementation of the retrieval interface kept for unit tests and as a fallback when Pinecone credentials are not configured. It is not the production retrieval path. Real performance numbers must come from Pinecone runs.
 
 Memory payloads are written to the retrieval backend only when they are indexed or when an already-indexed memory is updated. Delayed or unindexed memories stay in SQLite until an indexing action succeeds; they are not preloaded into Pinecone as hidden future search state. The deterministic test index keeps versioned entries with `available_at_ms`, so query-time search can return the latest memory version available at the query timestamp instead of the latest mutation that happened later in the rollout.
 
 The current index vectorization helper is deterministic and prototype-oriented so local tests and rollouts are reproducible. Pinecone is the real backend, but production retrieval semantics require configuring or extending the embedding path for the target deployment; do not treat the deterministic hashed vectors as a production embedding model.
 
-## 7. Dataset modes and real benchmarks
+## 7. Dataset
 
-The built-in synthetic dataset simulates streaming episodes, not static QA pairs. It is for tests, local smoke runs, and controlled debugging.
-
-Synthetic modes:
-
-- `small`: fast tests and local smoke runs.
-- `medium`: larger local checks.
-- `long`: longer synthetic stress checks.
-
-Generated streams include useful facts, low-value noise, duplicates, contradictions, stale updates, urgent facts, multiple users/entities, far-apart evidence, and storage/indexing pressure.
-
-Generate a dataset JSON file:
-
-```bash
-python3 scripts/generate_dataset.py --mode small --seed 7 --output results/dataset_small.json
-```
-
-Serious benchmark runs should use imported labeled streams. The first supported external adapter is LongMemEval from a local JSON file; the repo does not auto-download benchmark data. Imported LongMemEval events use neutral queue priority so evidence labels do not affect processing order.
+LongMemEval is the only supported dataset. The previous synthetic dataset
+generator and `--mock` LLM path have been removed: the goal of this
+project is to measure real memory-write behaviour against real
+human-authored conversations, not against templated fixtures. The repo
+does not auto-download benchmark data; obtain a LongMemEval JSON file
+separately.
 
 ```bash
 python3 scripts/run_eval.py \
-  --dataset-format longmemeval \
-  --dataset-path data/longmemeval_s_cleaned.json \
+  --longmemeval-path data/longmemeval_s_cleaned.json \
   --episode-index 0 \
   --output-dir results/lme_run
 ```
 
-Use `--mock --use-test-index` only for local adapter checks, not for real performance claims.
-
 ## 8. Metrics
 
-For synthetic streaming episodes, the write-path timing diagnostic is
-`time_to_useful_memory`:
-
-```text
-event arrives
--> raw event written
--> useful memory written/updated
--> memory indexed
--> memory retrieved by a future query
--> answer uses it correctly
-```
-
-`time_to_useful_memory` is `null` unless every required fact completes the full chain: event arrival -> raw write -> memory write/update -> index -> retrieval -> successful answer. Query retrieval is causally filtered: a query at time `T` can only retrieve memory/index versions whose simulated index availability time is at or before `T`. If a memory update completes after `T`, the query still sees the older indexed version that was available at `T`.
-
-For LongMemEval runs, `time_to_useful_memory` is not a headline metric because
-it depends heavily on where the labeled evidence appears in the stream. The
-LongMemEval headline scorecard follows the usual benchmark framing:
+The headline scorecard for LongMemEval runs:
 
 - `answer_success`
 - sub-task accuracy by `question_type`
@@ -163,35 +132,17 @@ answer_success = answer_correct AND evidence_correct
 
 Evidence correctness uses hidden evaluator labels keyed by memory `source_event_ids`; it does not require stored memories to carry `fact_ids`. Exact/contains matching is only debug information. The deterministic verifier normalizes the required fact strings and answer text to make the scoring transparent; it is intentionally conservative and not a claim of full semantic NLU. For LongMemEval, `predictions.jsonl` is also written so the official evaluator can be run separately.
 
-## 9. How to run with mock local test mode
-
-Install dependencies, then run tests:
+## 9. Install and test
 
 ```bash
 python3 -m pip install -e ".[dev]"
-```
-
-```bash
 pytest -q
 ```
 
-Run a reproducible mock evaluation using the test fake index:
-
-```bash
-python3 scripts/run_eval.py --mock --use-test-index --output-dir results/mock_run
-```
-
-Regenerate metrics and summary from the raw rollout log:
-
-```bash
-python3 scripts/evaluate_results.py results/mock_run/raw_rollouts.jsonl --output-dir results/mock_summary
-```
-
-For a smaller policy/action smoke run:
-
-```bash
-python3 scripts/run_llm_policy.py --mock --use-test-index
-```
+The test suite uses `tests/_test_llm_client.DeterministicTestLLMClient`, a
+deterministic test rig that lives inside the `tests/` package and is
+structurally unimportable from production code. There is no mock LLM
+client in `fast_memory_write_env`.
 
 ## 10. How to run with OpenAI-compatible LLM
 
@@ -235,7 +186,7 @@ For real retrieval runs, omit `--use-test-index`:
 python3 scripts/run_eval.py --output-dir results/pinecone_run
 ```
 
-Pinecone real retrieval runs require Pinecone environment variables. OpenAI-compatible LLM runs require OpenAI-compatible environment variables. A real Pinecone + real LLM run needs both sets of environment variables unless you are running the local mock path or explicitly using `--use-test-index`.
+Pinecone real retrieval runs require Pinecone environment variables. OpenAI-compatible LLM runs require OpenAI-compatible environment variables. A real Pinecone + real LLM run needs both sets of environment variables unless `--use-test-index` is passed for a local Pinecone-free check.
 
 The configured Pinecone index must match the vector dimension expected by the current deterministic vectorization helper unless you have added a production embedding path.
 
@@ -347,20 +298,6 @@ landed on `main`:
   SHA-256-anonymised before being shown so within-session correlation is
   preserved while the upstream `answer_*` prefix that LongMemEval uses on
   gold-evidence sessions cannot be read by the LLM.
-
-### Reproducible local mock run
-
-```text
-queries=4
-score=36.426
-answer_success=0.250
-time_to_useful_memory=1335.75
-```
-
-These are `MockLLMClient + InMemoryIndex` test fake results after label
-hiding, strict source-event validation, strict budgets, and query-time
-causality filtering. They are sanity checks for the pipeline, not
-performance claims.
 
 ## 14. Limitations / future work
 

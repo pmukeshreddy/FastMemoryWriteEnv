@@ -18,11 +18,13 @@ class StrictBaseModel(BaseModel):
 
 
 class DatasetMode(str, Enum):
-    """Supported dataset sizes."""
+    """Supported dataset modes.
 
-    SMALL = "small"
-    MEDIUM = "medium"
-    LONG = "long"
+    Only LongMemEval is supported. The historical synthetic ``SMALL`` /
+    ``MEDIUM`` / ``LONG`` modes have been removed along with the synthetic
+    dataset generator: real benchmark data only.
+    """
+
     LONGMEMEVAL = "longmemeval"
 
 
@@ -204,27 +206,6 @@ class StreamingEpisode(StrictBaseModel):
                     raise ValueError(f"duplicate query_id: {query.query_id}")
                 query_ids.add(query.query_id)
 
-        return self
-
-
-class GeneratedDataset(StrictBaseModel):
-    """A generated dataset containing one or more streaming episodes."""
-
-    dataset_id: str = Field(pattern=ID_PATTERN)
-    mode: DatasetMode
-    seed: int
-    episodes: list[StreamingEpisode] = Field(min_length=1)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def validate_episodes(self) -> GeneratedDataset:
-        episode_ids: set[str] = set()
-        for episode in self.episodes:
-            if episode.mode != self.mode:
-                raise ValueError("episode mode must match dataset mode")
-            if episode.episode_id in episode_ids:
-                raise ValueError(f"duplicate episode_id: {episode.episode_id}")
-            episode_ids.add(episode.episode_id)
         return self
 
 
