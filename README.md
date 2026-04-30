@@ -109,7 +109,7 @@ export PINECONE_REGION=us-east-1
 
 python3 scripts/run_eval_multi.py \
   --longmemeval-path data/longmemeval/longmemeval_s_cleaned.json \
-  --samples 1 \
+  --samples 50 \
   --write-worker-concurrency 8 \
   --output-dir results/lme_clean
 ```
