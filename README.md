@@ -108,7 +108,6 @@ export PINECONE_CLOUD=aws
 export PINECONE_REGION=us-east-1
 
 python3 scripts/run_eval_multi.py \
-  --dataset longmemeval \
   --longmemeval-path data/longmemeval/longmemeval_s_cleaned.json \
   --samples 1 \
   --write-worker-concurrency 8 \
