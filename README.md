@@ -68,7 +68,7 @@ Inputs to `policy.decide`:
 
 Output: a validated list of up to 4 structured actions from `{write_memory, update_memory, mark_stale, ignore_event, compress_memory, index_now, delay_index}`.
 
-### Production-grade guarantees
+### Validation and leakage controls
 
 - **Pydantic-validated everywhere.** Every proposed action is parsed against a strict schema before the environment will execute it. Invalid JSON triggers a bounded repair-retry loop with the validation error fed back into the prompt.
 - **OpenAI Structured Outputs.** `memory_action_response_format()` builds a `strict: true` JSON schema with a discriminated-union over the seven action types and an `ID_PATTERN` regex on every identifier — schema enforcement happens server-side at generation time.
