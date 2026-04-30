@@ -30,8 +30,7 @@ Position in the published LongMemEval-S landscape:
 
 ## What this is
 
-A streaming evaluator for a single LLM memory-write policy. Every chat turn becomes one event in a chronological stream; queries arrive while events are still coming. The policy receives one event at a time and returns validated structured actions — the environment executes them. The policy never mutates stores or calls the index directly.
-
+A streaming evaluator for a single LLM memory-write policy. Every chat turn becomes one event in a chronological stream; queries arrive while events are still coming. 
 ## What this is not
 
 Generic RAG. Long-document QA. A comparison of many hand-written memory strategies. A toy benchmark with no production pipeline. The minimal `NoMemoryBaseline`, `StoreEverythingBaseline`, and `OraclePolicy` exist as bounds, not as the main result.
