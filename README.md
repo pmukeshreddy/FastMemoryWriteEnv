@@ -112,10 +112,9 @@ export PINECONE_REGION=us-east-1
 python3 scripts/run_eval_multi.py \
   --dataset longmemeval \
   --longmemeval-path data/longmemeval/longmemeval_s_cleaned.json \
-  --samples 50 \
-  --concurrent-samples 50 \
+  --samples 1 \
   --write-worker-concurrency 8 \
-  --output-dir results/lme_50
+  --output-dir results/lme_clean
 ```
 
 Independent re-grading against the official LongMemEval evaluator:
