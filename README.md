@@ -154,13 +154,6 @@ Two distinct numbers are reported:
 - **`answer_success`** is the comparable-to-leaderboard metric. Per-query binary: 1 if `answer_correct AND evidence_correct`, 0 otherwise. `answer_correct` is an LLM-as-judge YES/NO verdict on whether the answer text conveys every gold answer fact. `evidence_correct` is a deterministic set check on cited memory ids vs gold supporting events / fact ids.
 - **`score`** (the composite) is project-internal: a weighted combination of `answer_success`, sub-task accuracy, memory recall and precision, minus storage and stale-memory penalties. It exists for ablation work; only `answer_success` should be compared against published systems.
 
-## Limitations
-
-- Per-action latencies are simulated under a fixed cost model (`BASE_LATENCY_MS`); `time_to_useful_memory` is a deterministic projection over those constants, not wall-clock. Real wall-clock instrumentation is straightforward to add but currently out of scope.
-- The Pinecone adapter stores the current vector under each `memory_id`; older `as_of_ms` queries against memories that have been overwritten can return stale or empty results under `worker_concurrency > 1` plus `update_memory` chains. `InMemoryIndex` is exact (versioned). Mitigation for production is to key vectors by `f"{memory_id}:{available_at_ms}"`.
-- The headline result is on n=50 with a self-grading judge (`gpt-4o-mini`). The full 500-question run with `evaluate_qa.py gpt-4o` is the next milestone; `predictions.jsonl` is shipped so external re-grading is one command away.
-- The policy is prompt-engineered; no RL training in this repo.
-- Synthetic dataset is for tests only — all reported numbers are LongMemEval.
 
 ## References
 
