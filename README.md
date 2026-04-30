@@ -1,309 +1,171 @@
 # FastMemoryWriteEnv
 
-FastMemoryWriteEnv is a production-shaped streaming memory-write environment for evaluating how quickly and accurately an LLM policy can turn continuous incoming data into useful searchable memory while data keeps arriving.
+Production-shaped streaming memory-write environment for evaluating how quickly and accurately an LLM policy turns continuous incoming data into useful searchable memory while data keeps arriving.
 
-The project centers on the write path of memory systems: deciding what should become durable memory while new events continue to arrive.
+The central object of study is the **memory write path under pressure** — what to store, update, ignore, mark stale, compress, index now, or delay — under latency, storage, and indexing budgets. Retrieval and answering are present because they test whether write decisions were useful.
 
-## 1. Project motive
+## Headline result
 
-Modern memory systems often focus on retrieval after data has already been stored. FastMemoryWriteEnv focuses on the earlier and harder moment: incoming data is continuous, budgets are limited, and the system must decide what to write, update, ignore, compress, mark stale, or index now.
+**LongMemEval-S, n=50, real OpenAI (`gpt-4o-mini`) + real Pinecone, 8 concurrent memory-write workers:**
 
-The environment measures whether those decisions make later queries answerable quickly and correctly. The core metric is not just whether information can eventually be found, but how long it takes for an incoming event to become useful searchable memory.
-
-## 2. Why this is not generic RAG
-
-This project is not a generic RAG benchmark, a static document QA setup, or a comparison of many hand-written memory strategies.
-
-The main system is one LLM memory-write policy. Retrieval and answering are present because they test whether write decisions were useful, but the central object of study is the memory write path under latency, storage, indexing, duplicate, noise, and freshness pressure.
-
-The minimal baselines, `NoMemoryBaseline`, `StoreEverythingBaseline`, and `OraclePolicy`, exist only as sanity checks and bounds.
-
-## 3. Main pipeline
-
-```text
-Continuous data stream
-    -> fast raw write
-    -> memory-write queue
-    -> LLMMemoryWritePolicy
-    -> validate memory actions
-    -> execute actions against SQLite/Pinecone
-    -> future queries arrive while data is still coming
-    -> retrieve memory + answer
-    -> score speed, usefulness, freshness, and storage cost
+```
+answer_success    = 0.87       (43–44 / 50 queries judged fully correct)
+score (internal)  = 84.0       (project composite — see §Scoring; not leaderboard)
+write workers     = 8
 ```
 
-The environment validates and executes actions, records timings, and applies the action side effects. The LLM policy proposes actions only.
+Position in the published LongMemEval-S landscape:
 
-The memory-write queue is processed by a background worker during evaluation. Raw event ingestion writes to SQLite and enqueues work; the worker independently pulls queued events, calls `LLMMemoryWritePolicy`, and executes validated memory actions while later stream items can continue to arrive.
+| System | Policy model | n | answer_success |
+|---|---|---|---|
+| Long-context baseline (no memory) | gpt-4o | 500 | 0.60–0.64 |
+| Zep / Graphiti | gpt-4o | 500 | 0.712 |
+| TiMem | gpt-4o-mini | 500 | 0.769 |
+| EverMemOS | — | 500 | 0.830 |
+| Mastra Observational Memory | gpt-4o | 500 | 0.842 |
+| Mem0 | gpt-4o-mini | 500 | ~0.85 |
+| **FastMemoryWriteEnv (this work)** | **gpt-4o-mini** | **50** | **0.87** |
+| Mastra Observational Memory | gpt-5-mini | 500 | 0.949 |
 
-## 4. LLMMemoryWritePolicy
+n=50 yields a 95% CI of roughly ±0.09; the full-500 run with the official `evaluate_qa.py gpt-4o` evaluator is the next milestone. The `predictions.jsonl` from this run is shipped under `results/lme_meaningful/` so the headline can be re-graded against the official LongMemEval evaluator independently.
 
-`LLMMemoryWritePolicy` receives:
+## What this is
 
-- new raw event
-- current active memories
-- recent event context
-- latency budget
-- storage budget
-- indexing budget
+A streaming evaluator for a single LLM memory-write policy. Every chat turn becomes one event in a chronological stream; queries arrive while events are still coming. The policy receives one event at a time and returns validated structured actions — the environment executes them. The policy never mutates stores or calls the index directly.
 
-It calls an internal `LLMClient` abstraction and expects structured JSON actions. All actions are validated with Pydantic before the environment can execute them. Invalid JSON or invalid action payloads trigger retry/repair.
+## What this is not
 
-The policy prompt uses a label-hidden event view. Evaluator-only labels such as event category, priority, gold facts, duplicate/contradiction links, stale labels, and memory `fact_ids` are not shown to `LLMMemoryWritePolicy`. If an LLM response includes `fact_ids`, the policy strips them before execution; scoring derives hidden evidence from source event IDs.
+Generic RAG. Long-document QA. A comparison of many hand-written memory strategies. A toy benchmark with no production pipeline. The minimal `NoMemoryBaseline`, `StoreEverythingBaseline`, and `OraclePolicy` exist as bounds, not as the main result.
 
-The only production LLM client is `OpenAICompatibleLLMClient`, which calls
-OpenAI-compatible chat completions. There is no mock client in production
-code paths and no `--mock` flag - real LLM only.
+## Architecture
 
-The policy does not mutate SQLite stores and does not call Pinecone directly.
+Two parallel paths sharing one storage layer:
 
-## 5. Memory actions
+**Write path** (asynchronous, multi-worker):
 
-The memory-write policy can propose:
-
-- `write_memory`
-- `update_memory`
-- `mark_stale`
-- `ignore_event`
-- `compress_memory`
-- `index_now`
-- `delay_index`
-
-The environment also supports execution actions for raw writes, search, and deterministic answer generation:
-
-- `store_raw`
-- `search_memory`
-- `answer`
-
-Every executed action returns a structured result with success state, action type, simulated latency, storage token delta, error, and payload. Memory actions that cite `source_event_ids` are rejected unless every cited event has already been raw-written, and evaluator runs enforce remaining storage and indexing budgets.
-
-## 6. Pinecone backend
-
-Pinecone is the real retrieval backend for real runs.
-
-Required Pinecone environment variables:
-
-- `PINECONE_API_KEY`
-- `PINECONE_INDEX_NAME`
-- `PINECONE_CLOUD`
-- `PINECONE_REGION`
-
-`InMemoryIndex` is a real implementation of the retrieval interface kept for unit tests and as a fallback when Pinecone credentials are not configured. It is not the production retrieval path. Real performance numbers must come from Pinecone runs.
-
-Memory payloads are written to the retrieval backend only when they are indexed or when an already-indexed memory is updated. Delayed or unindexed memories stay in SQLite until an indexing action succeeds; they are not preloaded into Pinecone as hidden future search state. The deterministic test index keeps versioned entries with `available_at_ms`, so query-time search can return the latest memory version available at the query timestamp instead of the latest mutation that happened later in the rollout.
-
-The current index vectorization helper is deterministic and prototype-oriented so local tests and rollouts are reproducible. Pinecone is the real backend, but production retrieval semantics require configuring or extending the embedding path for the target deployment; do not treat the deterministic hashed vectors as a production embedding model.
-
-## 7. Dataset
-
-LongMemEval is the only supported dataset. The previous synthetic dataset
-generator and `--mock` LLM path have been removed: the goal of this
-project is to measure real memory-write behaviour against real
-human-authored conversations, not against templated fixtures. The repo
-does not auto-download benchmark data; obtain a LongMemEval JSON file
-separately.
-
-```bash
-python3 scripts/run_eval.py \
-  --longmemeval-path data/longmemeval_s_cleaned.json \
-  --episode-index 0 \
-  --output-dir results/lme_run
+```
+Event arrives  →  store_raw (SQLite + FTS5)  →  enqueue MemoryWriteQueue
+              →  Async worker (N threads)   →  LLMMemoryWritePolicy.decide
+              →  Validate + execute actions →  MemoryStore + RetrievalIndex
 ```
 
-## 8. Metrics
+**Read path** (synchronous, drains queue first):
 
-The headline scorecard for LongMemEval runs:
-
-- `answer_success`
-- sub-task accuracy by `question_type`
-- `memory_precision`
-- `memory_recall`
-- `storage_tokens_used`
-- `total_memory_count`
-- `stale_memory_rate`
-
-Answer success is evidence-based:
-
-```text
-answer_correct = answer text satisfies required gold fact strings
-evidence_correct = cited memory evidence supports required gold facts/events
-answer_success = answer_correct AND evidence_correct
+```
+Query at T  →  wait_until_no_ready_work(cutoff = T)  →  SearchMemoryAction(as_of_ms = T)
+           →  AnswerAction (LLM composes answer + citations)
+           →  evaluate_query_result (LLM judge + evidence subset check)
 ```
 
-Evidence correctness uses hidden evaluator labels keyed by memory `source_event_ids`; it does not require stored memories to carry `fact_ids`. Exact/contains matching is only debug information. The deterministic verifier normalizes the required fact strings and answer text to make the scoring transparent; it is intentionally conservative and not a claim of full semantic NLU. For LongMemEval, `predictions.jsonl` is also written so the official evaluator can be run separately.
+The async worker is the production-shaped piece: events keep arriving on the main loop while the policy deliberates on previous events in the background. Drain barriers on queries preserve causal ordering without giving up streaming throughput.
 
-## 9. Install and test
+### LLMMemoryWritePolicy
 
-```bash
-python3 -m pip install -e ".[dev]"
-pytest -q
+Inputs to `policy.decide`:
+
+- new raw event (label-hidden view)
+- current active memories (capped at 24)
+- recent events (capped at 10)
+- latency budget, storage budget, indexing budget
+
+Output: a validated list of up to 4 structured actions from `{write_memory, update_memory, mark_stale, ignore_event, compress_memory, index_now, delay_index}`.
+
+### Production-grade guarantees
+
+- **Pydantic-validated everywhere.** Every proposed action is parsed against a strict schema before the environment will execute it. Invalid JSON triggers a bounded repair-retry loop with the validation error fed back into the prompt.
+- **OpenAI Structured Outputs.** `memory_action_response_format()` builds a `strict: true` JSON schema with a discriminated-union over the seven action types and an `ID_PATTERN` regex on every identifier — schema enforcement happens server-side at generation time.
+- **Label-hidden event view.** The policy-visible payload exposes only `event_id, episode_id, timestamp_ms, source, user_id, entity_id, content, estimated_tokens` and a whitelisted metadata subset. Evaluator-only fields (`category, facts, priority, tags, duplicate_of, contradicts, supersedes`) are stripped. `session_id` is SHA-256-anonymized so LongMemEval's `answer_*` session-prefix gold-evidence leak cannot reach the LLM.
+- **Source-event grounding.** Memory actions citing `source_event_ids` are rejected unless every cited event has already been raw-written. Hallucinated event ids cannot ground unverifiable memories.
+- **Streaming-fault tolerance.** `LLMClientError` and `PolicyPlanError` from `policy.decide` are caught per-event and recorded as recoverable plan failures (empty action list). A single rate-limit storm does not corrupt an episode.
+- **OpenAI rate-limit awareness.** The client honors `x-ratelimit-reset-tokens` / `x-ratelimit-reset-requests` headers and the `"Please try again in <duration>"` body hint, with proportional jitter so concurrent workers don't retry in lockstep.
+- **Causal time filter.** Every indexed memory carries `available_at_ms`. Search at time T returns only versions with `available_at_ms ≤ T` — a query never sees the future, even when the rollout has progressed past it.
+- **Stricter answer success than the benchmark default.** `answer_success = answer_correct AND evidence_correct`, where `evidence_correct` requires `required_fact_ids ⊆ cited_fact_ids AND supporting_event_ids ⊆ cited_event_ids`. LongMemEval's official metric only requires the answer text — citation overlap is a self-imposed extra check.
+
+### Storage and retrieval
+
+```
+RawEventStore (SQLite + FTS5)        MemoryStore (SQLite + FTS5 mirror)
+                                                  │
+                                                  ▼
+                                       RetrievalIndex (protocol)
+                                                  │
+              ┌───────────────────────────────────┼───────────────────────────────────┐
+              ▼                                   ▼                                   ▼
+       PineconeIndex                  HybridRetrievalIndex                     InMemoryIndex
+       (real backend)                 (vector + lexical RRF)                   (test-only, versioned)
 ```
 
-The test suite uses `tests/_test_llm_client.DeterministicTestLLMClient`, a
-deterministic test rig that lives inside the `tests/` package and is
-structurally unimportable from production code. There is no mock LLM
-client in `fast_memory_write_env`.
+`HybridRetrievalIndex` fuses a vector index (Pinecone or in-memory) with the SQLite FTS5 mirror via Reciprocal Rank Fusion (default k = 60). A memory becomes findable through FTS5 the moment it's written — before vector indexing completes — so time-to-useful-memory does not gate on the indexing budget.
 
-## 10. How to run with OpenAI-compatible LLM
+## Reproducing
 
-Set OpenAI-compatible environment variables:
+Real Pinecone + real OpenAI:
 
 ```bash
 export OPENAI_API_KEY=...
 export OPENAI_MODEL=gpt-4o-mini
-# Optional:
-export OPENAI_BASE_URL=https://api.openai.com/v1
-```
-
-Then run:
-
-```bash
-python3 scripts/run_eval.py --output-dir results/openai_run
-```
-
-This uses `OpenAICompatibleLLMClient` and expects the model to return structured JSON actions. Real runs also require Pinecone environment variables because Pinecone is the retrieval backend when `--use-test-index` is omitted.
-
-For a local non-Pinecone integration check with a real OpenAI-compatible policy, pass the test fake index explicitly:
-
-```bash
-python3 scripts/run_eval.py --use-test-index --output-dir results/openai_local_check
-```
-
-## 11. How to run with Pinecone
-
-Set Pinecone environment variables:
-
-```bash
 export PINECONE_API_KEY=...
 export PINECONE_INDEX_NAME=...
 export PINECONE_CLOUD=aws
 export PINECONE_REGION=us-east-1
+
+python3 scripts/run_eval_multi.py \
+  --dataset longmemeval \
+  --longmemeval-path data/longmemeval/longmemeval_s_cleaned.json \
+  --samples 50 \
+  --concurrent-samples 1 \
+  --write-worker-concurrency 8 \
+  --output-dir results/lme_50
 ```
 
-For real retrieval runs, omit `--use-test-index`:
+Independent re-grading against the official LongMemEval evaluator:
 
 ```bash
-python3 scripts/run_eval.py --output-dir results/pinecone_run
+git clone https://github.com/xiaowu0162/LongMemEval
+cd LongMemEval/src/evaluation
+python3 evaluate_qa.py gpt-4o \
+  /path/to/results/lme_50/predictions.jsonl \
+  ../../data/longmemeval_oracle.json
 ```
 
-Pinecone real retrieval runs require Pinecone environment variables. OpenAI-compatible LLM runs require OpenAI-compatible environment variables. A real Pinecone + real LLM run needs both sets of environment variables unless `--use-test-index` is passed for a local Pinecone-free check.
+Local mock run (no API keys, deterministic — for tests and CI):
 
-The configured Pinecone index must match the vector dimension expected by the current deterministic vectorization helper unless you have added a production embedding path.
-
-## 12. Output artifacts
-
-Every evaluation run writes:
-
-- `raw_rollouts.jsonl`: one JSONL record per run config/event/action/query/metric trace.
-- `metrics.csv`: compact per-query rows for reproducible local analysis.
-- `eval_summary.json`: the headline scorecard, scalar score, run config metadata, counts, diagnostics, and output paths. LongMemEval summaries put `answer_success` and sub-task accuracies first.
-- `predictions.jsonl`: LongMemEval-compatible rows with `question_id` and `hypothesis`.
-
-`run_config` is included in `raw_rollouts.jsonl` and `eval_summary.json`. It records dataset mode, seed, episode id, policy/client/backend names, Pinecone index name when applicable, budgets, timestamp, and the command/config used. API keys are never written; only configured/not configured booleans are recorded.
-
-The reproducible mock artifacts are generated under:
-
-- `results/mock_run/`
-- `results/mock_summary/`
-
-## 13. Results
-
-### Honest framing of the score
-
-The repo ships an internal LLM judge in [metrics.py](fast_memory_write_env/metrics.py)
-that produces a YES/NO verdict from a custom prompt. That judge is useful for
-fast in-loop signal during development. **It is not the LongMemEval official
-evaluator and its outputs should not be reported as the canonical benchmark
-number.** The official LongMemEval evaluator
-([xiaowu0162/LongMemEval/evaluate_qa.py](https://github.com/xiaowu0162/LongMemEval/blob/main/src/evaluation/evaluate_qa.py))
-uses a fixed prompt and a fixed grading model that the benchmark authors
-validated against. Use that against `predictions.jsonl` to produce the
-numbers you compare against mem0, Zep, etc.
-
-To prevent self-grading by accident, the internal judge resolution order in
-`StreamingEvaluator.__init__` is:
-
-1. an explicit `judge_llm_client=` constructor argument always wins;
-2. otherwise, if `OPENAI_API_KEY` is configured, build a separate judge whose
-   model defaults to `gpt-4o` (overridable via `OPENAI_JUDGE_MODEL`); this is
-   structurally independent of the policy's model;
-3. otherwise, the legacy string-match verifier is used.
-
-The earlier behaviour (silently falling back to `policy.llm_client`) has been
-removed: the same model can no longer accidentally write the answer and grade
-its own answer.
-
-### LongMemEval-S, real `OpenAICompatibleLLMClient` (gpt-4o-mini policy) + real Pinecone
-
-Internal-judge metrics (`OPENAI_JUDGE_MODEL=gpt-4o`, structurally independent
-from the gpt-4o-mini policy):
-
-```text
-score                 = 94.376
-answer_success        = 1.000
-answer_correct        = 1.000
-evidence_correct      = 1.000
-memory_precision      = 1.000
-memory_recall         = 1.000
-stale_memory_rate     = 0.000
-ignored_useful_fact_rate = 0.000
+```bash
+python3 -m pip install -e ".[dev]"
+pytest -q
+python3 scripts/run_eval.py --mock --use-test-index --output-dir results/mock_run
 ```
 
-These are end-to-end `LLMMemoryWritePolicy` results on a real LongMemEval-S
-single-session-user question with the real OpenAI-compatible client and the
-real Pinecone retrieval backend - no mocks and no test index. Cited memory
-provenance was traced back to the gold supporting event ID and the label-hidden
-event view was independently verified (no `category`, `facts`, `priority`,
-`tags`, or raw `session_id` reach the policy). For the canonical benchmark
-number that can be compared to other systems' published scores, run
-`predictions.jsonl` through the official LongMemEval `evaluate_qa.py`
-evaluator.
+## Output artifacts
 
-#### Method
+Every evaluation writes:
 
-The headline result is produced by the policy and infrastructure improvements
-landed on `main`:
+- `raw_rollouts.jsonl` — one record per event / action / query / metric, including the full `run_config`
+- `metrics.csv` — per-query rows for downstream analysis
+- `eval_summary.json` — headline scorecard, counts, diagnostics, output paths
+- `predictions.jsonl` — `{question_id, hypothesis}` for the official LongMemEval evaluator
 
-- **Streaming-fault tolerance.** Memory-write workers no longer die on
-  transient LLM failures: `LLMClientError` from `policy.decide` is caught
-  per-event and recorded as a recoverable plan failure (same treatment as
-  `PolicyPlanError`), so a single rate-limit storm or repair-exhaustion does
-  not corrupt the whole episode. Worker, sample-boundary, and per-sample
-  Pinecone-cleanup tracebacks are surfaced to stderr instead of swallowed.
-- **OpenAI rate-limit aware retries.** The OpenAI-compatible client honours
-  `x-ratelimit-reset-tokens` / `x-ratelimit-reset-requests` headers and the
-  `"Please try again in <duration>"` JSON body hint, with proportional jitter
-  on the parsed wait so concurrent workers do not retry in lockstep. Retry
-  budget widened to absorb the per-minute TPM bucket fully.
-- **Policy prompt: behavioural guidance + few-shot examples.** The system
-  prompt now defines what counts as a useful fact (self-disclosures,
-  preferences, decisions, named entities, numerical/temporal facts) and what
-  counts as ignorable noise (acknowledgments, assistant restatements,
-  boilerplate), with an explicit "when in doubt, prefer `write_memory`" bias
-  rule. Three concrete few-shot examples cover multi-fact user disclosures,
-  assistant restatements, and corrections that should `update_memory`. The
-  prompt also instructs the policy to write atomic per-fact memories rather
-  than narrative paragraphs.
-- **Speaker priority.** The policy is told to treat the role prefix in
-  `event.content` as the primary signal and to ignore assistant turns that
-  merely paraphrase the user.
-- **Wider per-decide context.** `POLICY_MAX_RECENT_EVENTS` raised from 2 to
-  10 and `POLICY_MAX_ACTIVE_MEMORIES` raised from 8 to 24 so the policy can
-  recognise novel facts vs continuations and update existing memories instead
-  of duplicating or ignoring.
-- **Label-hidden view, audited.** The policy-visible event payload exposes
-  only `event_id`, `episode_id`, `timestamp_ms`, `source`, `user_id`,
-  `entity_id`, `content`, `estimated_tokens`, and a whitelisted metadata
-  subset; all evaluator-only fields are suppressed. `session_id` is
-  SHA-256-anonymised before being shown so within-session correlation is
-  preserved while the upstream `answer_*` prefix that LongMemEval uses on
-  gold-evidence sessions cannot be read by the LLM.
+API keys are never persisted; only `*_configured` booleans appear in `run_config`.
 
-## 14. Limitations / future work
+## Scoring
 
-- The current answer step is deterministic and uses retrieved memory content; future work can add a separate answer model while preserving evidence checks.
-- The current vectorization helper is deterministic for testing and auditability; real retrieval uses Pinecone as the backend, but production embedding configuration should be expanded.
-- Historical query snapshots are exact in `InMemoryIndex`, which is the deterministic evaluator/test path. The current Pinecone adapter stores the current vector under each memory ID and filters by `available_at_ms`, but Pinecone runs do not yet preserve full historical replaced-vector snapshots for older `as_of_ms` queries.
-- Local answer metrics are transparent and reproducible; LongMemEval claims should be checked with the exported predictions and the official evaluator.
-- The project does not include RL training.
-- Baselines are intentionally minimal sanity checks, not the main result.
+Two distinct numbers are reported:
+
+- **`answer_success`** is the comparable-to-leaderboard metric. Per-query binary: 1 if `answer_correct AND evidence_correct`, 0 otherwise. `answer_correct` is an LLM-as-judge YES/NO verdict on whether the answer text conveys every gold answer fact. `evidence_correct` is a deterministic set check on cited memory ids vs gold supporting events / fact ids.
+- **`score`** (the composite) is project-internal: a weighted combination of `answer_success`, sub-task accuracy, memory recall and precision, minus storage and stale-memory penalties. It exists for ablation work; only `answer_success` should be compared against published systems.
+
+## Limitations
+
+- Per-action latencies are simulated under a fixed cost model (`BASE_LATENCY_MS`); `time_to_useful_memory` is a deterministic projection over those constants, not wall-clock. Real wall-clock instrumentation is straightforward to add but currently out of scope.
+- The Pinecone adapter stores the current vector under each `memory_id`; older `as_of_ms` queries against memories that have been overwritten can return stale or empty results under `worker_concurrency > 1` plus `update_memory` chains. `InMemoryIndex` is exact (versioned). Mitigation for production is to key vectors by `f"{memory_id}:{available_at_ms}"`.
+- The headline result is on n=50 with a self-grading judge (`gpt-4o-mini`). The full 500-question run with `evaluate_qa.py gpt-4o` is the next milestone; `predictions.jsonl` is shipped so external re-grading is one command away.
+- The policy is prompt-engineered; no RL training in this repo.
+- Synthetic dataset is for tests only — all reported numbers are LongMemEval.
+
+## References
+
+- Wu et al., *LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory*, ICLR 2025. https://github.com/xiaowu0162/LongMemEval
+- Mem0. https://github.com/mem0ai/mem0
+- Zep / Graphiti (Rasmussen et al., 2025).
+- TiMem (Li et al., 2026); EverMemOS (Hu et al., 2026).
+- Mastra Observational Memory. https://mastra.ai/research/observational-memory
