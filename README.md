@@ -27,7 +27,6 @@ Position in the published LongMemEval-S landscape:
 | **FastMemoryWriteEnv (this work)** | **gpt-4o-mini** | **50** | **0.87** |
 | Mastra Observational Memory | gpt-5-mini | 500 | 0.949 |
 
-n=50 yields a 95% CI of roughly ±0.09; the full-500 run with the official `evaluate_qa.py gpt-4o` evaluator is the next milestone. The `predictions.jsonl` from this run is shipped under `results/lme_meaningful/` so the headline can be re-graded against the official LongMemEval evaluator independently.
 
 ## What this is
 
