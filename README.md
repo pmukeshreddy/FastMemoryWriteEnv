@@ -128,13 +128,6 @@ python3 evaluate_qa.py gpt-4o \
   ../../data/longmemeval_oracle.json
 ```
 
-Local mock run (no API keys, deterministic — for tests and CI):
-
-```bash
-python3 -m pip install -e ".[dev]"
-pytest -q
-python3 scripts/run_eval.py --mock --use-test-index --output-dir results/mock_run
-```
 
 ## Output artifacts
 
