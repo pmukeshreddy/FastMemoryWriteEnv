@@ -4,8 +4,16 @@ Production-shaped streaming memory-write environment for evaluating how quickly 
 
 The central object of study is the **memory write path under pressure** — what to store, update, ignore, mark stale, compress, index now, or delay — under latency, storage, and indexing budgets. Retrieval and answering are present because they test whether write decisions were useful.
 
-## Headline result
+## Key contributions
 
+- **Online memory-write environment.** Events arrive as a stream, and queries can arrive before the stream is finished.
+- **Typed memory-action policy.** The LLM does not directly mutate storage; it proposes structured actions such as write, update, ignore, mark stale, compress, index now, or delay.
+- **Async ingestion path.** Raw events are written immediately while memory extraction runs in worker threads, so ingestion does not block on LLM policy latency.
+- **Causal read barrier.** Queries drain ready work up to their timestamp, so answers can use fresh memory without seeing future events.
+- **Hybrid immediate retrieval.** FTS5 makes memory searchable as soon as it is written, while vector indexing can catch up separately.
+- **Leakage-resistant evaluation.** Label-hidden event views, source-event grounding, schema validation, and causal time filters reduce benchmark shortcuts.
+
+## Headline result
 **LongMemEval-S, n=50, real OpenAI (`gpt-4o-mini`) + real Pinecone, 8 concurrent memory-write workers:**
 
 ```
