@@ -37,7 +37,11 @@ from fast_memory_write_env.embeddings import (
 from fast_memory_write_env.env import FastMemoryWriteEnv
 from fast_memory_write_env.hybrid_index import HybridRetrievalIndex
 from fast_memory_write_env.in_memory_index import InMemoryIndex
-from fast_memory_write_env.llm_client import LLMClient, LLMClientError
+from fast_memory_write_env.llm_client import (
+    LLMClient,
+    LLMClientError,
+    OpenAICompatibleLLMClient,
+)
 from fast_memory_write_env.metrics import (
     AggregateCounterSnapshot,
     AggregateMetrics,
@@ -364,14 +368,25 @@ class StreamingEvaluator:
         if write_worker_concurrency < 1:
             raise ValueError("write_worker_concurrency must be >= 1")
         self.write_worker_concurrency = write_worker_concurrency
-        # Default the answer-correctness judge to the policy's LLM client when
-        # one is available (LLMMemoryWritePolicy exposes ``llm_client``).
-        # Baselines and rule-based test policies have no client, so scoring
-        # falls back to the legacy string-match verifier.
-        self.judge_llm_client: LLMClient | None = (
+        # Resolve the answer-correctness judge. We deliberately do NOT fall
+        # back to ``policy.llm_client`` here: that would let the same model
+        # both produce the answer and grade it, which inflates accuracy
+        # numbers via correlated errors and makes results non-comparable to
+        # benchmark leaderboards (e.g. mem0, Zep) that use an independent
+        # judge. The resolution order is:
+        #   1. an explicit ``judge_llm_client`` argument always wins;
+        #   2. otherwise, if ``OPENAI_API_KEY`` is configured, build a
+        #      separate judge client whose model defaults to ``gpt-4o``
+        #      (overridable via ``OPENAI_JUDGE_MODEL``); this is the
+        #      structurally-independent default;
+        #   3. otherwise, ``None`` and the legacy string-match verifier in
+        #      metrics.py is used (preserves the baselines / mock / test path).
+        # Headline benchmark numbers should still be produced by running
+        # ``predictions.jsonl`` through the official LongMemEval
+        # ``evaluate_qa.py`` evaluator; this internal judge is for fast,
+        # in-loop signal only.
+        self.judge_llm_client: LLMClient | None = self._resolve_judge_client(
             judge_llm_client
-            if judge_llm_client is not None
-            else getattr(policy, "llm_client", None)
         )
         # The env composes per-query answers through an LLM. When a caller
         # constructs the env directly (legacy / unit-test path) and the
@@ -384,6 +399,28 @@ class StreamingEvaluator:
         )
         if resolved_answer_client is not None and getattr(env, "answer_llm_client", None) is None:
             env.answer_llm_client = resolved_answer_client
+
+    @staticmethod
+    def _resolve_judge_client(explicit: LLMClient | None) -> LLMClient | None:
+        """Pick the answer-correctness judge LLM client.
+
+        Order of resolution:
+        1. ``explicit`` (the constructor argument) always wins.
+        2. If ``OPENAI_API_KEY`` is configured, build a separate judge whose
+           model is ``OPENAI_JUDGE_MODEL`` (default ``gpt-4o``). This is the
+           structurally-independent default and avoids self-grading by the
+           policy's own model.
+        3. Otherwise return ``None`` and let ``metrics.py`` fall back to the
+           legacy string-match verifier (used by baselines, the mock client,
+           and the test suite).
+        """
+
+        if explicit is not None:
+            return explicit
+        if not os.getenv("OPENAI_API_KEY"):
+            return None
+        judge_model = os.getenv("OPENAI_JUDGE_MODEL") or "gpt-4o"
+        return OpenAICompatibleLLMClient(model=judge_model)
 
     @classmethod
     def with_local_test_index(

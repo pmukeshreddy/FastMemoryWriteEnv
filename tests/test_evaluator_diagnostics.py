@@ -326,9 +326,11 @@ def _episode_for_ben_or_dee() -> StreamingEpisode:
 
 
 def test_ada_failure_is_blocked_by_plan_validation_and_recorded(tmp_path) -> None:
+    policy = _AdaUpdateAndStalePolicy()
     evaluator = StreamingEvaluator(
         env=_build_env(tmp_path),
-        policy=_AdaUpdateAndStalePolicy(),
+        policy=policy,
+        judge_llm_client=policy.llm_client,
         storage_budget_tokens_remaining=1000,
         indexing_budget_operations_remaining=2,
     )
@@ -350,9 +352,11 @@ def test_ada_failure_is_blocked_by_plan_validation_and_recorded(tmp_path) -> Non
 
 
 def test_ben_delayed_index_leaves_query_unanswerable(tmp_path) -> None:
+    policy = _BenDelayedIndexPolicy()
     evaluator = StreamingEvaluator(
         env=_build_env(tmp_path),
-        policy=_BenDelayedIndexPolicy(),
+        policy=policy,
+        judge_llm_client=policy.llm_client,
         storage_budget_tokens_remaining=1000,
         indexing_budget_operations_remaining=0,
     )
@@ -383,9 +387,11 @@ def test_ben_delayed_index_recovered_by_hybrid_retrieval(tmp_path) -> None:
     job of ``compress_memory`` (see the Dee scenario).
     """
 
+    policy = _BenDelayedIndexPolicy()
     evaluator = StreamingEvaluator(
         env=_build_hybrid_env(tmp_path),
-        policy=_BenDelayedIndexPolicy(),
+        policy=policy,
+        judge_llm_client=policy.llm_client,
         storage_budget_tokens_remaining=1000,
         indexing_budget_operations_remaining=0,
     )
@@ -401,9 +407,11 @@ def test_ben_delayed_index_recovered_by_hybrid_retrieval(tmp_path) -> None:
 
 
 def test_dee_compression_makes_query_answerable_under_tight_budget(tmp_path) -> None:
+    policy = _DeeCompressionPolicy()
     evaluator = StreamingEvaluator(
         env=_build_env(tmp_path),
-        policy=_DeeCompressionPolicy(),
+        policy=policy,
+        judge_llm_client=policy.llm_client,
         storage_budget_tokens_remaining=2000,
         indexing_budget_operations_remaining=1,
     )
@@ -419,9 +427,11 @@ def test_dee_compression_makes_query_answerable_under_tight_budget(tmp_path) -> 
 
 
 def test_eval_summary_contains_per_query_failure_diagnostics(tmp_path) -> None:
+    policy = _BenDelayedIndexPolicy()
     evaluator = StreamingEvaluator(
         env=_build_env(tmp_path),
-        policy=_BenDelayedIndexPolicy(),
+        policy=policy,
+        judge_llm_client=policy.llm_client,
         storage_budget_tokens_remaining=1000,
         indexing_budget_operations_remaining=0,
     )

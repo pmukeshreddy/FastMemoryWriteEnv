@@ -267,9 +267,11 @@ def _causal_evaluator(tmp_path) -> StreamingEvaluator:
         memory_store=MemoryStore(tmp_path / "memory.sqlite"),
         retrieval_index=InMemoryIndex(),
     )
+    policy = _WriteAndIndexPolicy()
     return StreamingEvaluator(
         env=env,
-        policy=_WriteAndIndexPolicy(),
+        policy=policy,
+        judge_llm_client=policy.llm_client,
         storage_budget_tokens_remaining=100,
         indexing_budget_operations_remaining=1,
     )
@@ -281,9 +283,11 @@ def _color_update_evaluator(tmp_path) -> StreamingEvaluator:
         memory_store=MemoryStore(tmp_path / "memory.sqlite"),
         retrieval_index=InMemoryIndex(),
     )
+    policy = _ColorUpdatePolicy()
     return StreamingEvaluator(
         env=env,
-        policy=_ColorUpdatePolicy(),
+        policy=policy,
+        judge_llm_client=policy.llm_client,
         storage_budget_tokens_remaining=100,
         indexing_budget_operations_remaining=5,
     )

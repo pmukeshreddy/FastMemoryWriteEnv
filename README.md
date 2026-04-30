@@ -257,7 +257,35 @@ The reproducible mock artifacts are generated under:
 
 ## 13. Results
 
-### LongMemEval-S, real `OpenAICompatibleLLMClient` (gpt-4o-mini) + real Pinecone
+### Honest framing of the score
+
+The repo ships an internal LLM judge in [metrics.py](fast_memory_write_env/metrics.py)
+that produces a YES/NO verdict from a custom prompt. That judge is useful for
+fast in-loop signal during development. **It is not the LongMemEval official
+evaluator and its outputs should not be reported as the canonical benchmark
+number.** The official LongMemEval evaluator
+([xiaowu0162/LongMemEval/evaluate_qa.py](https://github.com/xiaowu0162/LongMemEval/blob/main/src/evaluation/evaluate_qa.py))
+uses a fixed prompt and a fixed grading model that the benchmark authors
+validated against. Use that against `predictions.jsonl` to produce the
+numbers you compare against mem0, Zep, etc.
+
+To prevent self-grading by accident, the internal judge resolution order in
+`StreamingEvaluator.__init__` is:
+
+1. an explicit `judge_llm_client=` constructor argument always wins;
+2. otherwise, if `OPENAI_API_KEY` is configured, build a separate judge whose
+   model defaults to `gpt-4o` (overridable via `OPENAI_JUDGE_MODEL`); this is
+   structurally independent of the policy's model;
+3. otherwise, the legacy string-match verifier is used.
+
+The earlier behaviour (silently falling back to `policy.llm_client`) has been
+removed: the same model can no longer accidentally write the answer and grade
+its own answer.
+
+### LongMemEval-S, real `OpenAICompatibleLLMClient` (gpt-4o-mini policy) + real Pinecone
+
+Internal-judge metrics (`OPENAI_JUDGE_MODEL=gpt-4o`, structurally independent
+from the gpt-4o-mini policy):
 
 ```text
 score                 = 94.376
@@ -275,7 +303,10 @@ single-session-user question with the real OpenAI-compatible client and the
 real Pinecone retrieval backend - no mocks and no test index. Cited memory
 provenance was traced back to the gold supporting event ID and the label-hidden
 event view was independently verified (no `category`, `facts`, `priority`,
-`tags`, or raw `session_id` reach the policy).
+`tags`, or raw `session_id` reach the policy). For the canonical benchmark
+number that can be compared to other systems' published scores, run
+`predictions.jsonl` through the official LongMemEval `evaluate_qa.py`
+evaluator.
 
 #### Method
 
