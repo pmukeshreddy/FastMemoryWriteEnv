@@ -10,7 +10,7 @@ The central object of study is the **memory write path under pressure** — what
 
 ```
 answer_success    = 0.87       (43–44 / 50 queries judged fully correct)
-score (internal)  = 84.0       (project composite — see §Scoring; not leaderboard)
+score (internal)  = 84.0       (project composite )
 write workers     = 8
 ```
 
